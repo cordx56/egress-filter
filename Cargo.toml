@@ -2,6 +2,10 @@
 name = "egress-filter"
 version = "0.1.0"
 edition = "2024"
+description = "Linux egress filter using seccomp user notification for outbound network policy control"
+license = "MIT"
+keywords = ["seccomp", "network", "filter", "egress", "security"]
+categories = ["network-programming", "os::linux-apis"]
 
 [[bin]]
 name = "egress-filter"
