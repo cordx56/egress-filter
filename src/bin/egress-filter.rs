@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[command(version, about)]
 struct Args {
     /// Path to the allow list configuration file (YAML).
-    /// If not specified, all connections are denied by default.
+    /// If not specified, `egress-allowlist.yaml` in the current directory is used.
     #[arg(short = 'c', long)]
     config: Option<PathBuf>,
 

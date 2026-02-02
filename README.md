@@ -32,7 +32,7 @@ cargo build --release
 ## CLI Usage
 
 ```bash
-# Default behavior: deny all outbound traffic
+# Default behavior: load ./egress-allowlist.yaml
 ./target/release/egress-filter curl https://example.com
 
 # Use a policy file
@@ -41,6 +41,8 @@ cargo build --release
 # Disable filtering (allow all)
 ./target/release/egress-filter --allow-all npm install
 ```
+
+Without `--allow-all`, a policy file must be loadable (`-c <path>` or `./egress-allowlist.yaml`).
 
 ## Configuration
 
@@ -104,9 +106,11 @@ Normal syscall-level destination filtering is still active.
 
 ## Hot-Reload
 
-When a configuration file is specified with `-c`, the supervisor watches for changes and automatically reloads the allowlist. This allows updating rules without restarting the supervised process.
+When policy loading is enabled (default, or via `-c`), the supervisor watches the active configuration file and automatically reloads the allowlist. This allows updating rules without restarting the supervised process.
 
 The watcher uses debouncing (500ms) to handle editors that save files in multiple steps.
+
+If watcher startup fails, egress filtering continues with the initially loaded configuration.
 
 ## Library Usage
 

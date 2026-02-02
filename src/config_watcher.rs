@@ -79,17 +79,9 @@ impl ConfigWatcher {
 /// reload notifications through a channel.
 pub fn spawn_config_watcher(config_path: &Path) -> Result<Receiver<ConfigEvent>, notify::Error> {
     let (tx, rx) = mpsc::channel();
-    let config_path = config_path.to_path_buf();
+    let watcher = ConfigWatcher::new(config_path)?;
 
     thread::spawn(move || {
-        let watcher = match ConfigWatcher::new(&config_path) {
-            Ok(w) => w,
-            Err(e) => {
-                error!("failed to create config watcher: {}", e);
-                return;
-            }
-        };
-
         // Debounce: wait a bit after receiving an event before forwarding
         // This handles editors that save files in multiple steps
         let debounce_duration = Duration::from_millis(500);
