@@ -220,11 +220,13 @@ impl Supervisor {
         )
         .context("failed to create socket pair")?;
 
-        // Block SIGCHLD and create signalfd before fork.
-        // This allows the parent to detect child termination via poll().
+        // Block signals and create signalfd before fork.
+        // This allows the parent to detect child termination and handle termination signals.
         let mut sigset = SigSet::empty();
         sigset.add(Signal::SIGCHLD);
-        sigset.thread_block().context("failed to block SIGCHLD")?;
+        sigset.add(Signal::SIGTERM);
+        sigset.add(Signal::SIGINT);
+        sigset.thread_block().context("failed to block signals")?;
         let signal_fd = SignalFd::with_flags(&sigset, SfdFlags::SFD_NONBLOCK)
             .context("failed to create signalfd")?;
 
@@ -263,6 +265,11 @@ impl Supervisor {
         args: &[CString],
         env: &[CString],
     ) -> Result<()> {
+        // Request SIGKILL when parent dies (safety net for orphaned child)
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        }
+
         // Create and load the seccomp filter
         let filter = SeccompFilter::new().context("failed to create seccomp filter")?;
         let notify_fd = filter.load().context("failed to load seccomp filter")?;
@@ -479,13 +486,22 @@ impl Supervisor {
                 }
             }
 
-            // Check if signal_fd is readable (child terminated)
+            // Check if signal_fd is readable (signal received)
             if poll_fds[1]
                 .revents()
                 .is_some_and(|r| r.contains(PollFlags::POLLIN))
             {
-                // Read and discard the signal info
-                let _ = signal_fd.read_signal();
+                // Read the signal info
+                if let Ok(Some(siginfo)) = signal_fd.read_signal() {
+                    let signo = siginfo.ssi_signo as i32;
+
+                    // Forward termination signals to child
+                    if signo == libc::SIGTERM || signo == libc::SIGINT {
+                        info!("received signal {}, forwarding to child", signo);
+                        let _ = nix::sys::signal::kill(child, Signal::try_from(signo).ok());
+                        // Continue to wait for child to exit
+                    }
+                }
 
                 // Check child status
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)) {

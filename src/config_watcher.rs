@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
+use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
 /// Message sent when configuration file changes.
@@ -28,17 +29,43 @@ impl ConfigWatcher {
     pub fn new(config_path: &Path) -> Result<Self, notify::Error> {
         let (tx, rx) = mpsc::channel();
 
+        // Canonicalize the config path for reliable comparison
+        let config_file = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.to_path_buf());
+        let config_filename = config_file.file_name().map(PathBuf::from);
+
         let event_tx = tx.clone();
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    // Filter for modification events only
-                    if matches!(
+                    // Check if the event is for our config file
+                    let is_config_file = event.paths.iter().any(|p| {
+                        // Compare by filename (handles symlinks and path variations)
+                        if let Some(ref expected) = config_filename {
+                            p.file_name().map(PathBuf::from).as_ref() == Some(expected)
+                        } else {
+                            false
+                        }
+                    });
+
+                    if !is_config_file {
+                        return;
+                    }
+
+                    // Handle various save behaviors from different editors:
+                    // - Direct write: Modify(Data)
+                    // - Atomic save (vim, emacs): Remove + Create or Rename
+                    // - Write + close: Modify(Any)
+                    let should_reload = matches!(
                         event.kind,
                         notify::EventKind::Modify(ModifyKind::Data(_))
                             | notify::EventKind::Modify(ModifyKind::Any)
-                    ) {
-                        debug!("config file modified: {:?}", event.paths);
+                            | notify::EventKind::Create(_)
+                    );
+
+                    if should_reload {
+                        debug!("config file changed: {:?} ({:?})", event.paths, event.kind);
                         let _ = event_tx.send(ConfigEvent::Modified);
                     }
                 }
@@ -54,7 +81,11 @@ impl ConfigWatcher {
         let watch_path = config_path.parent().unwrap_or(Path::new("."));
 
         watcher.watch(watch_path, RecursiveMode::NonRecursive)?;
-        info!("watching configuration directory: {}", watch_path.display());
+        info!(
+            "watching configuration file: {} (in {})",
+            config_file.display(),
+            watch_path.display()
+        );
 
         Ok(Self {
             _watcher: watcher,
