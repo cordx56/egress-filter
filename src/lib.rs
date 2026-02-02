@@ -49,6 +49,9 @@ pub use seccomp::notify::InterceptedSyscall;
 
 use anyhow::{Context, Result};
 use nix::cmsg_space;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::socket::{
     AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
     sendmsg, socketpair,
@@ -58,7 +61,7 @@ use nix::unistd::{ForkResult, Pid, fork};
 use std::ffi::CString;
 use std::io::{IoSlice, IoSliceMut};
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -217,17 +220,29 @@ impl Supervisor {
         )
         .context("failed to create socket pair")?;
 
+        // Block SIGCHLD and create signalfd before fork.
+        // This allows the parent to detect child termination via poll().
+        let mut sigset = SigSet::empty();
+        sigset.add(Signal::SIGCHLD);
+        sigset.thread_block().context("failed to block SIGCHLD")?;
+        let signal_fd = SignalFd::with_flags(&sigset, SfdFlags::SFD_NONBLOCK)
+            .context("failed to create signalfd")?;
+
         // SAFETY: We're careful to only do async-signal-safe operations
         // in the child between fork and exec.
         match unsafe { fork() }.context("fork failed")? {
             ForkResult::Parent { child } => {
                 // Close child's end of the socket
                 drop(child_sock);
-                self.supervisor_main(child, parent_sock, proxy_state)
+                self.supervisor_main(child, parent_sock, proxy_state, signal_fd)
             }
             ForkResult::Child => {
                 // Close parent's end of the socket
                 drop(parent_sock);
+                // Close signalfd in child (not needed)
+                drop(signal_fd);
+                // Unblock SIGCHLD in child
+                let _ = sigset.thread_unblock();
 
                 // In child: create filter, load it, send fd, then exec
                 match self.child_main(child_sock, program, &c_args, &env) {
@@ -286,6 +301,7 @@ impl Supervisor {
         child: Pid,
         sock: OwnedFd,
         proxy_state: Option<Arc<ProxyState>>,
+        signal_fd: SignalFd,
     ) -> Result<i32> {
         // Receive the notify fd from child via SCM_RIGHTS
         let mut buf = [0u8; 1];
@@ -370,7 +386,7 @@ impl Supervisor {
             None
         };
 
-        self.supervisor_loop(child, notify_fd, proxy_redirect)
+        self.supervisor_loop(child, notify_fd, proxy_redirect, signal_fd)
     }
 
     fn supervisor_loop(
@@ -378,6 +394,7 @@ impl Supervisor {
         child: Pid,
         notify_fd: OwnedFd,
         proxy_redirect: Option<ProxyRedirect>,
+        signal_fd: SignalFd,
     ) -> Result<i32> {
         let handler = NotificationHandler::new(notify_fd);
         let mut network_handler = NetworkHandler::new(&handler, Arc::clone(&self.allowlist));
@@ -401,6 +418,10 @@ impl Supervisor {
         };
 
         let mut notification_count = 0u64;
+
+        // Set up poll fds for notify_fd and signal_fd
+        let notify_fd_raw = handler.as_raw_fd();
+        let signal_fd_raw = signal_fd.as_fd();
 
         loop {
             // Check for config reload events
@@ -438,62 +459,97 @@ impl Supervisor {
             {
                 al.cleanup_dns_cache();
             }
-            // Check if child is still running (non-blocking)
-            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => {}
-                Ok(WaitStatus::Exited(_, code)) => {
-                    info!("child exited with code {}", code);
-                    return Ok(code);
-                }
-                Ok(WaitStatus::Signaled(_, sig, _)) => {
-                    info!("child killed by signal {:?}", sig);
-                    return Ok(128 + sig as i32);
-                }
-                Ok(status) => {
-                    debug!("child status: {:?}", status);
-                }
-                Err(nix::Error::ECHILD) => {
-                    // Child already reaped
-                    debug!("child already gone");
-                    break;
-                }
+
+            // Use poll to wait for either:
+            // - notify_fd becoming readable (new seccomp notification)
+            // - signal_fd becoming readable (SIGCHLD received)
+            let notify_borrow = unsafe { BorrowedFd::borrow_raw(notify_fd_raw) };
+            let mut poll_fds = [
+                PollFd::new(notify_borrow, PollFlags::POLLIN),
+                PollFd::new(signal_fd_raw, PollFlags::POLLIN),
+            ];
+
+            match poll(&mut poll_fds, PollTimeout::NONE) {
+                Ok(0) => continue, // Timeout (shouldn't happen with NONE)
+                Ok(_) => {}
+                Err(nix::Error::EINTR) => continue, // Interrupted, retry
                 Err(e) => {
-                    warn!("waitpid error: {}", e);
+                    error!("poll error: {}", e);
+                    continue;
                 }
             }
 
-            // Receive notification (blocking)
-            let notification = match handler.receive() {
-                Ok(n) => n,
-                Err(e) => {
-                    let err_str = e.to_string();
-                    // These errors indicate the child process has exited
-                    if err_str.contains("ENOENT")
-                        || err_str.contains("ESRCH")
-                        || err_str.contains("EBADF")
-                        || err_str.contains("system failure")
-                    {
-                        debug!("notification fd closed, child likely exited");
+            // Check if signal_fd is readable (child terminated)
+            if poll_fds[1]
+                .revents()
+                .is_some_and(|r| r.contains(PollFlags::POLLIN))
+            {
+                // Read and discard the signal info
+                let _ = signal_fd.read_signal();
+
+                // Check child status
+                match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) => {
+                        // Child still running, continue
+                    }
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        info!("child exited with code {}", code);
+                        return Ok(code);
+                    }
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        info!("child killed by signal {:?}", sig);
+                        return Ok(128 + sig as i32);
+                    }
+                    Ok(status) => {
+                        debug!("child status: {:?}", status);
+                    }
+                    Err(nix::Error::ECHILD) => {
+                        debug!("child already gone");
                         break;
                     }
-                    error!("receive error: {}", e);
-                    continue;
+                    Err(e) => {
+                        warn!("waitpid error: {}", e);
+                    }
                 }
-            };
+            }
 
-            debug!(
-                "notification: pid={} syscall={:?}",
-                notification.pid, notification.syscall
-            );
+            // Check if notify_fd is readable (new notification)
+            if poll_fds[0]
+                .revents()
+                .is_some_and(|r| r.contains(PollFlags::POLLIN))
+            {
+                let notification = match handler.receive() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        // These errors indicate the child process has exited
+                        if err_str.contains("ENOENT")
+                            || err_str.contains("ESRCH")
+                            || err_str.contains("EBADF")
+                            || err_str.contains("system failure")
+                        {
+                            debug!("notification fd closed, child likely exited");
+                            break;
+                        }
+                        error!("receive error: {}", e);
+                        continue;
+                    }
+                };
 
-            match network_handler.handle(&notification) {
-                Ok(decision) => {
-                    debug!("decision: {:?}", decision);
-                }
-                Err(e) => {
-                    error!("handler error: {}", e);
-                    // Try to allow on error to avoid hanging the child
-                    let _ = handler.allow(&notification);
+                debug!(
+                    "notification: pid={} syscall={:?}",
+                    notification.pid, notification.syscall
+                );
+
+                match network_handler.handle(&notification) {
+                    Ok(decision) => {
+                        debug!("decision: {:?}", decision);
+                    }
+                    Err(e) => {
+                        error!("handler error: {}", e);
+                        // Try to allow on error to avoid hanging the child
+                        let _ = handler.allow(&notification);
+                    }
                 }
             }
         }

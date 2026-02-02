@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 libseccomp = "0.4"
-nix = { version = "0.31", features = ["process", "fs", "uio", "signal", "socket"] }
+nix = { version = "0.31", features = ["process", "fs", "uio", "signal", "socket", "poll"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

@@ -1,5 +1,5 @@
 use libseccomp::{ScmpNotifReq, ScmpNotifResp, ScmpNotifRespFlags, ScmpSyscall, notify_id_valid};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -81,6 +81,12 @@ impl SyscallNotification {
 /// Handles seccomp notifications on a notify fd.
 pub struct NotificationHandler {
     fd: OwnedFd,
+}
+
+impl AsRawFd for NotificationHandler {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 impl NotificationHandler {
