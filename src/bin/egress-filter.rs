@@ -38,11 +38,12 @@ fn main() -> Result<()> {
     // Load or create allow list config
     let config = if args.allow_all {
         AllowListConfig::allow_all()
-    } else if let Some(config_path) = args.config {
+    } else {
+        let config_path = args
+            .config
+            .unwrap_or_else(|| "egress-allowlist.yaml".into());
         AllowListConfig::load(&config_path)
             .with_context(|| format!("failed to load config from {:?}", config_path))?
-    } else {
-        AllowListConfig::deny_all()
     };
 
     // Create supervisor and run

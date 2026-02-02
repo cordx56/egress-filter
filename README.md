@@ -53,16 +53,27 @@ doh:
   enabled: true
 
 domains:
-  - pattern: "api.anthropic.com"
-    ports: [443]
-    reason: Claude API
+  - pattern: "github.com"
+    ports: [22, 443]
   - pattern: "*.github.com"
     ports: [443]
 
 ip_ranges:
-  - cidr: "127.0.0.53/32"
-    ports: [53]
+  # Localhost
+  - cidr: "127.0.0.0/8"
+  - cidr: "::1/128"
+  - cidr: "::ffff:127.0.0.0/104"
+
+  # LAN
   - cidr: "10.0.0.0/8"
+  - cidr: "172.16.0.0/12"
+  - cidr: "192.168.0.0/16"
+
+  # Cloudflare DNS
+  - cidr: "1.1.1.1/32"
+    ports: [53, 443]
+  - cidr: "1.0.0.1/32"
+    ports: [53, 443]
 ```
 
 Field notes:
