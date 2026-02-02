@@ -1,0 +1,48 @@
+[package]
+name = "egress-filter"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "egress-filter"
+path = "src/bin/egress-filter.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libseccomp = "0.4"
+nix = { version = "0.31", features = ["process", "fs", "uio", "signal", "socket"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ipnetwork = "0.21"
+which = "8"
+
+# TLS and HTTPS proxy (use ring backend to avoid aws-lc-rs GLIBC issues)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+
+# HTTP handling
+hyper = { version = "1.5", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+http = "1"
+
+# Certificate generation
+rcgen = "0.14"
+time = "0.3"
+
+# Async runtime
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+
+# Utilities
+base64 = "0.22"
+url = "2"
+webpki-roots = "1"
