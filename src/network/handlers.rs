@@ -92,7 +92,7 @@ impl SocketTracker {
 /// Handles network-related syscall notifications.
 pub struct NetworkHandler<'a> {
     handler: &'a NotificationHandler,
-    allowlist: &'a AllowList,
+    allowlist: Arc<RwLock<AllowList>>,
     /// Proxy redirect configuration (if DoH interception is enabled).
     proxy_redirect: Option<ProxyRedirect>,
     /// Tracks connected sockets for send() handling.
@@ -100,13 +100,18 @@ pub struct NetworkHandler<'a> {
 }
 
 impl<'a> NetworkHandler<'a> {
-    pub fn new(handler: &'a NotificationHandler, allowlist: &'a AllowList) -> Self {
+    pub fn new(handler: &'a NotificationHandler, allowlist: Arc<RwLock<AllowList>>) -> Self {
         Self {
             handler,
             allowlist,
             proxy_redirect: None,
             socket_tracker: SocketTracker::new(),
         }
+    }
+
+    /// Returns a reference to the allowlist for external access.
+    pub fn allowlist(&self) -> &Arc<RwLock<AllowList>> {
+        &self.allowlist
     }
 
     /// Sets the proxy redirect configuration for TLS interception.
@@ -287,10 +292,11 @@ impl<'a> NetworkHandler<'a> {
         target: &ConnectionTarget,
         _parsed: &ParsedAddress,
     ) -> Result<Decision, HandlerError> {
+        let allowlist = self.allowlist.read().unwrap();
         let allowed = if let Some(ref dns_name) = target.dns_name {
-            self.allowlist.is_domain_allowed(dns_name, target.port)
+            allowlist.is_domain_allowed(dns_name, target.port)
         } else {
-            self.allowlist.is_ip_allowed(target.ip, target.port)
+            allowlist.is_ip_allowed(target.ip, target.port)
         };
 
         if allowed {
@@ -301,8 +307,8 @@ impl<'a> NetworkHandler<'a> {
             })
         } else {
             info!("denied: {}", target);
-            // Output a message to stderr that agents can see (deduplicated)
-            if self.allowlist.should_notify_block(target.ip, target.port) {
+            // Output a message to stderr (deduplicated)
+            if allowlist.should_notify_block(target.ip, target.port) {
                 eprintln!("[egress-filter] Connection blocked: {}", target);
             }
             self.handler.deny(notification)?;
@@ -451,11 +457,12 @@ impl<'a> NetworkHandler<'a> {
         };
 
         // Check allowlist - for DNS queries, check domain without port restriction
+        let allowlist = self.allowlist.read().unwrap();
         let allowed = if let Some(ref name) = target.dns_name {
-            self.allowlist.is_dns_query_allowed(name)
+            allowlist.is_dns_query_allowed(name)
         } else {
             // Can't parse DNS query, fall back to IP check
-            self.allowlist.is_ip_allowed(target.ip, target.port)
+            allowlist.is_ip_allowed(target.ip, target.port)
         };
 
         if allowed {
@@ -466,7 +473,7 @@ impl<'a> NetworkHandler<'a> {
             })
         } else {
             info!("denied: {} (DNS query)", target);
-            if self.allowlist.should_notify_block(target.ip, target.port) {
+            if allowlist.should_notify_block(target.ip, target.port) {
                 eprintln!("[egress-filter] DNS query blocked: {}", target);
             }
             self.handler.deny(notification)?;
@@ -536,11 +543,12 @@ impl<'a> NetworkHandler<'a> {
         };
 
         // Check allowlist - for DNS queries, check domain without port restriction
+        let allowlist = self.allowlist.read().unwrap();
         let allowed = if let Some(ref name) = target.dns_name {
-            self.allowlist.is_dns_query_allowed(name)
+            allowlist.is_dns_query_allowed(name)
         } else {
             // Can't parse DNS query, fall back to IP check
-            self.allowlist.is_ip_allowed(target.ip, target.port)
+            allowlist.is_ip_allowed(target.ip, target.port)
         };
 
         if allowed {
@@ -551,7 +559,7 @@ impl<'a> NetworkHandler<'a> {
             })
         } else {
             info!("denied: {} (DNS query)", target);
-            if self.allowlist.should_notify_block(target.ip, target.port) {
+            if allowlist.should_notify_block(target.ip, target.port) {
                 eprintln!("[egress-filter] DNS query blocked: {}", target);
             }
             self.handler.deny(notification)?;

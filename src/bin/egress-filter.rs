@@ -36,18 +36,20 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load or create allow list config
-    let config = if args.allow_all {
-        AllowListConfig::allow_all()
+    let supervisor = if args.allow_all {
+        let config = AllowListConfig::allow_all();
+        Supervisor::new(config)
     } else {
         let config_path = args
             .config
             .unwrap_or_else(|| "egress-allowlist.yaml".into());
-        AllowListConfig::load(&config_path)
-            .with_context(|| format!("failed to load config from {:?}", config_path))?
+        let config = AllowListConfig::load(&config_path)
+            .with_context(|| format!("failed to load config from {:?}", config_path))?;
+        // Use with_config_path to enable hot-reloading
+        Supervisor::with_config_path(config, config_path)
     };
 
-    // Create supervisor and run
-    let supervisor = Supervisor::new(config);
+    // Run the command
     let exit_code = supervisor.run(&args.command)?;
 
     std::process::exit(exit_code);

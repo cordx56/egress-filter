@@ -35,6 +35,7 @@
 
 mod allowlist;
 pub mod ca;
+mod config_watcher;
 mod network;
 pub mod proxy;
 mod seccomp;
@@ -60,33 +61,40 @@ use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
+
+use config_watcher::ConfigEvent;
 
 use ca::CaState;
 use proxy::{AllowListChecker, ProxyServer, ProxyState, ResolutionCache};
 
 /// Supervisor that runs a command under egress filtering.
 pub struct Supervisor {
-    allowlist: Arc<AllowList>,
+    allowlist: Arc<RwLock<AllowList>>,
     config: AllowListConfig,
+    /// Path to the configuration file for hot-reloading.
+    config_path: Option<PathBuf>,
 }
 
 /// Wrapper to implement AllowListChecker for AllowList
-struct AllowListWrapper(Arc<AllowList>);
+struct AllowListWrapper(Arc<RwLock<AllowList>>);
 
 impl AllowListChecker for AllowListWrapper {
     fn is_domain_allowed(&self, domain: &str, port: u16) -> bool {
-        self.0.is_domain_allowed(domain, port)
+        self.0.read().unwrap().is_domain_allowed(domain, port)
     }
 }
 
 /// Wrapper to implement ResolutionCache for AllowList
-struct ResolutionCacheWrapper(Arc<AllowList>);
+struct ResolutionCacheWrapper(Arc<RwLock<AllowList>>);
 
 impl ResolutionCache for ResolutionCacheWrapper {
     fn cache_resolution(&self, domain: &str, addresses: &[IpAddr], ports: Vec<u16>) {
-        self.0.cache_doh_resolution(domain, addresses, ports);
+        self.0
+            .read()
+            .unwrap()
+            .cache_doh_resolution(domain, addresses, ports);
     }
 }
 
@@ -128,8 +136,18 @@ impl Supervisor {
     /// Creates a new supervisor with the given allowlist configuration.
     pub fn new(config: AllowListConfig) -> Self {
         Self {
-            allowlist: Arc::new(AllowList::new(&config)),
+            allowlist: Arc::new(RwLock::new(AllowList::new(&config))),
             config,
+            config_path: None,
+        }
+    }
+
+    /// Creates a new supervisor that watches the configuration file for changes.
+    pub fn with_config_path(config: AllowListConfig, path: PathBuf) -> Self {
+        Self {
+            allowlist: Arc::new(RwLock::new(AllowList::new(&config))),
+            config,
+            config_path: Some(path),
         }
     }
 
@@ -362,20 +380,63 @@ impl Supervisor {
         proxy_redirect: Option<ProxyRedirect>,
     ) -> Result<i32> {
         let handler = NotificationHandler::new(notify_fd);
-        let mut network_handler = NetworkHandler::new(&handler, &self.allowlist);
+        let mut network_handler = NetworkHandler::new(&handler, Arc::clone(&self.allowlist));
 
         // Configure proxy redirect if enabled
         if let Some(redirect) = proxy_redirect {
             network_handler = network_handler.with_proxy_redirect(redirect);
         }
 
+        // Start config watcher if a config path was provided
+        let config_receiver = if let Some(ref path) = self.config_path {
+            match config_watcher::spawn_config_watcher(path) {
+                Ok(rx) => Some(rx),
+                Err(e) => {
+                    warn!("failed to start config watcher: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut notification_count = 0u64;
 
         loop {
+            // Check for config reload events
+            if let Some(ref rx) = config_receiver {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        ConfigEvent::Modified => {
+                            if let Some(ref path) = self.config_path {
+                                info!("configuration file changed, reloading...");
+                                match AllowListConfig::load(path) {
+                                    Ok(new_config) => {
+                                        let new_allowlist = AllowList::new(&new_config);
+                                        if let Ok(mut al) = self.allowlist.write() {
+                                            *al = new_allowlist;
+                                            info!("configuration reloaded successfully");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to reload config: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        ConfigEvent::Error(e) => {
+                            warn!("config watcher error: {}", e);
+                        }
+                    }
+                }
+            }
+
             // Periodically clean up expired DNS cache entries (every 100 notifications)
             notification_count = notification_count.wrapping_add(1);
-            if notification_count.is_multiple_of(100) {
-                self.allowlist.cleanup_dns_cache();
+            if notification_count.is_multiple_of(100)
+                && let Ok(al) = self.allowlist.read()
+            {
+                al.cleanup_dns_cache();
             }
             // Check if child is still running (non-blocking)
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {

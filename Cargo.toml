@@ -50,3 +50,6 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "sy
 base64 = "0.22"
 url = "2"
 webpki-roots = "1"
+
+# File watching for config reload
+notify = "8"

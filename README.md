@@ -15,6 +15,7 @@ It uses seccomp user notification to intercept network syscalls and enforce an a
   - `doh.enabled`
 - DNS resolution caching for allowed domains
 - Optional DoH inspection mode (`doh.enabled: true`)
+- Configuration hot-reload (automatically reloads on file change)
 
 ## Requirements
 
@@ -100,6 +101,12 @@ When `doh.enabled: true`, the supervisor:
 
 When `doh.enabled: false`, DoH MITM/inspection and CA injection are disabled.
 Normal syscall-level destination filtering is still active.
+
+## Hot-Reload
+
+When a configuration file is specified with `-c`, the supervisor watches for changes and automatically reloads the allowlist. This allows updating rules without restarting the supervised process.
+
+The watcher uses debouncing (500ms) to handle editors that save files in multiple steps.
 
 ## Library Usage
 
