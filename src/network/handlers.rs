@@ -261,9 +261,9 @@ impl<'a> NetworkHandler<'a> {
             }
         };
 
-        // If this is DNS (port 53), try to parse the query
-        let dns_name = if parsed.is_dns && buf_len > 0 {
-            match DnsQuery::parse(mem, buf_ptr, buf_len) {
+        // If this is DNS (port 53), handle as a DNS query
+        if parsed.is_dns && buf_len > 0 {
+            let dns_name = match DnsQuery::parse(mem, buf_ptr, buf_len) {
                 Ok(query) => {
                     debug!("DNS query for: {}", query.name);
                     Some(query.name)
@@ -272,18 +272,58 @@ impl<'a> NetworkHandler<'a> {
                     debug!("failed to parse DNS query: {}", e);
                     None
                 }
-            }
-        } else {
-            None
-        };
+            };
+
+            let target = ConnectionTarget {
+                ip: parsed.ip(),
+                port: parsed.port(),
+                dns_name,
+            };
+
+            return self.decide_dns_query(notification, &target);
+        }
 
         let target = ConnectionTarget {
             ip: parsed.ip(),
             port: parsed.port(),
-            dns_name,
+            dns_name: None,
         };
 
         self.decide_and_respond(notification, &target, &parsed)
+    }
+
+    /// Decides whether to allow or deny a DNS query.
+    /// Uses `is_dns_query_allowed` which checks domain rules without port restriction,
+    /// since the target port here is the DNS server port (53), not the service port.
+    fn decide_dns_query(
+        &self,
+        notification: &SyscallNotification,
+        target: &ConnectionTarget,
+    ) -> Result<Decision, HandlerError> {
+        let allowlist = self.allowlist.read().unwrap();
+        let allowed = if let Some(ref name) = target.dns_name {
+            allowlist.is_dns_query_allowed(name)
+        } else {
+            // Can't parse DNS query, fall back to IP check
+            allowlist.is_ip_allowed(target.ip, target.port)
+        };
+
+        if allowed {
+            info!("allowed: {} (DNS query)", target);
+            self.handler.allow(notification)?;
+            Ok(Decision::Allowed {
+                target: target.clone(),
+            })
+        } else {
+            info!("denied: {} (DNS query)", target);
+            if allowlist.should_notify_block(target.ip, target.port) {
+                eprintln!("[egress-filter] DNS query blocked: {}", target);
+            }
+            self.handler.deny(notification)?;
+            Ok(Decision::Denied {
+                target: target.clone(),
+            })
+        }
     }
 
     fn decide_and_respond(
@@ -456,29 +496,7 @@ impl<'a> NetworkHandler<'a> {
             dns_name,
         };
 
-        // Check allowlist - for DNS queries, check domain without port restriction
-        let allowlist = self.allowlist.read().unwrap();
-        let allowed = if let Some(ref name) = target.dns_name {
-            allowlist.is_dns_query_allowed(name)
-        } else {
-            // Can't parse DNS query, fall back to IP check
-            allowlist.is_ip_allowed(target.ip, target.port)
-        };
-
-        if allowed {
-            info!("allowed: {} (DNS query)", target);
-            self.handler.allow(notification)?;
-            Ok(Decision::Allowed {
-                target: target.clone(),
-            })
-        } else {
-            info!("denied: {} (DNS query)", target);
-            if allowlist.should_notify_block(target.ip, target.port) {
-                eprintln!("[egress-filter] DNS query blocked: {}", target);
-            }
-            self.handler.deny(notification)?;
-            Ok(Decision::Denied { target })
-        }
+        self.decide_dns_query(notification, &target)
     }
 
     /// Handles send(fd, buf, len, flags) syscall for connected sockets.
@@ -542,28 +560,6 @@ impl<'a> NetworkHandler<'a> {
             dns_name,
         };
 
-        // Check allowlist - for DNS queries, check domain without port restriction
-        let allowlist = self.allowlist.read().unwrap();
-        let allowed = if let Some(ref name) = target.dns_name {
-            allowlist.is_dns_query_allowed(name)
-        } else {
-            // Can't parse DNS query, fall back to IP check
-            allowlist.is_ip_allowed(target.ip, target.port)
-        };
-
-        if allowed {
-            info!("allowed: {} (DNS query)", target);
-            self.handler.allow(notification)?;
-            Ok(Decision::Allowed {
-                target: target.clone(),
-            })
-        } else {
-            info!("denied: {} (DNS query)", target);
-            if allowlist.should_notify_block(target.ip, target.port) {
-                eprintln!("[egress-filter] DNS query blocked: {}", target);
-            }
-            self.handler.deny(notification)?;
-            Ok(Decision::Denied { target })
-        }
+        self.decide_dns_query(notification, &target)
     }
 }

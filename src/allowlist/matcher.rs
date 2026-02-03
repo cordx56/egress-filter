@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use ipnetwork::IpNetwork;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::config::{AllowListConfig, DefaultPolicy, DomainRule, IpRule};
 
@@ -109,14 +109,14 @@ impl AllowList {
     }
 
     /// Checks if a domain:port is allowed.
-    /// If allowed, also resolves the domain and caches the IPs for future connect() calls.
+    /// If allowed, tracks the domain for future IP lookups.
     pub fn is_domain_allowed(&self, domain: &str, port: u16) -> bool {
         let domain_lower = domain.to_lowercase();
 
         for rule in &self.domains {
             if rule.matches(&domain_lower) && rule.port_allowed(port) {
-                // Domain is allowed - resolve and cache IPs
-                self.resolve_and_cache(&domain_lower, rule.allowed_ports());
+                // Track the domain so refresh_and_check_ip can resolve it later
+                self.track_domain(&domain_lower, rule.allowed_ports());
                 return true;
             }
         }
@@ -127,13 +127,17 @@ impl AllowList {
     /// Checks if a DNS query for a domain should be allowed.
     /// This checks if the domain is in the allowlist, ignoring port restrictions.
     /// Used for filtering DNS queries where we don't know the target port yet.
+    ///
+    /// Does NOT perform synchronous DNS resolution here, because the child's
+    /// DNS query hasn't actually been sent yet at this point. Resolution is
+    /// deferred to connect() time via `refresh_and_check_ip`.
     pub fn is_dns_query_allowed(&self, domain: &str) -> bool {
         let domain_lower = domain.to_lowercase();
 
         for rule in &self.domains {
             if rule.matches(&domain_lower) {
-                // Domain is allowed - resolve and cache IPs with allowed ports
-                self.resolve_and_cache(&domain_lower, rule.allowed_ports());
+                // Track the domain so refresh_and_check_ip can resolve it later
+                self.track_domain(&domain_lower, rule.allowed_ports());
                 return true;
             }
         }
@@ -166,8 +170,28 @@ impl AllowList {
         self.default_policy == DefaultPolicy::Allow
     }
 
+    /// Ensures a domain is tracked in the cache with its allowed ports.
+    /// Creates an entry with empty IPs if one doesn't exist yet.
+    /// This allows `refresh_and_check_ip` to resolve the domain later at connect() time.
+    fn track_domain(&self, domain: &str, ports: Vec<u16>) {
+        let Ok(mut cache) = self.dns_cache.write() else {
+            return;
+        };
+        let domain_key = domain.to_string();
+        cache.entry(domain_key).or_insert_with(|| {
+            debug!("tracking allowed domain: {}", domain);
+            DnsCacheEntry {
+                ips: Vec::new(),
+                ports,
+                updated_at: Instant::now(),
+            }
+        });
+    }
+
     /// Resolves a domain and merges the resulting IPs into the cache.
     /// Existing IPs are preserved to handle DNS round-robin and rotation.
+    /// If resolution fails, a domain entry is still created so it can be
+    /// re-resolved later.
     fn resolve_and_cache(&self, domain: &str, ports: Vec<u16>) {
         // Try to resolve the domain using the system resolver
         let addr_str = format!("{}:0", domain);
@@ -176,13 +200,15 @@ impl AllowList {
                 let new_ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
                 if new_ips.is_empty() {
                     debug!("DNS resolution returned no IPs for {}", domain);
+                    self.track_domain(domain, ports);
                     return;
                 }
 
                 self.merge_into_cache(domain, &new_ips, ports);
             }
             Err(e) => {
-                warn!("failed to resolve {}: {}", domain, e);
+                debug!("failed to resolve {}: {}", domain, e);
+                self.track_domain(domain, ports);
             }
         }
     }
@@ -580,6 +606,55 @@ domains:
         );
         assert!(allowlist.is_cached_ip_allowed(ip_b, 443));
         assert!(allowlist.is_cached_ip_allowed(ip_c, 443));
+    }
+
+    /// Tests the deferred resolution flow that occurs at startup.
+    ///
+    /// When a DNS query is intercepted, `is_dns_query_allowed` tracks the domain
+    /// in the cache with empty IPs (no synchronous resolution). Later, when the
+    /// child process calls connect() with the resolved IP, `is_ip_allowed` triggers
+    /// `refresh_and_check_ip`, which re-resolves all tracked domains and finds a match.
+    ///
+    /// This test simulates the flow using `cache_doh_resolution` to inject IPs
+    /// (as if the child's DNS query had completed), verifying that `track_domain`
+    /// + later cache population allows connect() to succeed.
+    #[test]
+    fn track_domain_deferred_resolution() {
+        let config = AllowListConfig::parse(
+            r#"
+version: 1
+default_policy: deny
+domains:
+  - pattern: "deferred.example.com"
+    ports: [443]
+"#,
+        )
+        .unwrap();
+        let allowlist = AllowList::new(&config);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 50));
+
+        // Step 1: DNS query intercepted — domain tracked with empty IPs
+        assert!(allowlist.is_dns_query_allowed("deferred.example.com"));
+
+        // Verify the cache entry exists but has no IPs yet
+        {
+            let cache = allowlist.dns_cache.read().unwrap();
+            let entry = cache
+                .get("deferred.example.com")
+                .expect("domain should be tracked");
+            assert!(entry.ips.is_empty(), "no IPs should be cached yet");
+            assert_eq!(entry.ports, vec![443]);
+        }
+
+        // Step 2: Child's DNS query completes, DoH proxy caches the result
+        allowlist.cache_doh_resolution("deferred.example.com", &[ip], vec![443]);
+
+        // Step 3: Child calls connect() — IP should now be allowed via cache
+        assert!(allowlist.is_ip_allowed(ip, 443));
+
+        // Port restriction is still enforced
+        assert!(!allowlist.is_ip_allowed(ip, 80));
     }
 
     /// Tests that port restrictions are enforced on cached DNS entries.
