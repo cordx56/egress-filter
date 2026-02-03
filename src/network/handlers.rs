@@ -330,9 +330,18 @@ impl<'a> NetworkHandler<'a> {
         &self,
         notification: &SyscallNotification,
         target: &ConnectionTarget,
-        _parsed: &ParsedAddress,
+        parsed: &ParsedAddress,
     ) -> Result<Decision, HandlerError> {
         let allowlist = self.allowlist.read().unwrap();
+
+        if parsed.is_dns && allowlist.allow_authoritative_dns() {
+            info!("allowed: {} (DNS server connect)", target);
+            self.handler.allow(notification)?;
+            return Ok(Decision::Allowed {
+                target: target.clone(),
+            });
+        }
+
         let allowed = if let Some(ref dns_name) = target.dns_name {
             allowlist.is_domain_allowed(dns_name, target.port)
         } else {

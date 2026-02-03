@@ -58,6 +58,15 @@ pub struct DohConfig {
     pub enabled: bool,
 }
 
+/// DNS handling configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DnsConfig {
+    /// Allow outbound DNS server connections (port 53) to any IP.
+    /// Useful for iterative resolvers that contact authoritative servers directly.
+    #[serde(default)]
+    pub allow_authoritative: bool,
+}
+
 /// AllowList configuration file format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowListConfig {
@@ -76,6 +85,10 @@ pub struct AllowListConfig {
     /// IP ranges to allow.
     #[serde(default)]
     pub ip_ranges: Vec<IpRule>,
+
+    /// DNS handling settings.
+    #[serde(default)]
+    pub dns: DnsConfig,
 
     /// DoH interception settings.
     #[serde(default)]
@@ -107,6 +120,7 @@ impl AllowListConfig {
             default_policy: DefaultPolicy::Deny,
             domains: Vec::new(),
             ip_ranges: Vec::new(),
+            dns: DnsConfig::default(),
             doh: DohConfig::default(),
         }
     }
@@ -118,6 +132,7 @@ impl AllowListConfig {
             default_policy: DefaultPolicy::Allow,
             domains: Vec::new(),
             ip_ranges: Vec::new(),
+            dns: DnsConfig::default(),
             doh: DohConfig::default(),
         }
     }
@@ -163,6 +178,9 @@ mod tests {
 version: 1
 default_policy: deny
 
+dns:
+  allow_authoritative: true
+
 domains:
   - pattern: "*.anthropic.com"
     ports: [443]
@@ -186,6 +204,7 @@ ip_ranges:
         let config = AllowListConfig::parse(EXAMPLE_CONFIG).unwrap();
         assert_eq!(config.version, 1);
         assert_eq!(config.default_policy, DefaultPolicy::Deny);
+        assert!(config.dns.allow_authoritative);
         assert_eq!(config.domains.len(), 2);
         assert_eq!(config.ip_ranges.len(), 1);
 
