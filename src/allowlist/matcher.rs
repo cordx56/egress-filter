@@ -18,7 +18,8 @@ const BLOCKED_NOTIFY_TTL: Duration = Duration::from_secs(60); // 1 minute
 struct DnsCacheEntry {
     ips: Vec<IpAddr>,
     ports: Vec<u16>,
-    expires_at: Instant,
+    /// Timestamp of the most recent update. Used for TTL.
+    updated_at: Instant,
 }
 
 /// Compiled allowlist for efficient matching.
@@ -165,36 +166,74 @@ impl AllowList {
         self.default_policy == DefaultPolicy::Allow
     }
 
-    /// Resolves a domain and caches the resulting IPs.
+    /// Resolves a domain and merges the resulting IPs into the cache.
+    /// Existing IPs are preserved to handle DNS round-robin and rotation.
     fn resolve_and_cache(&self, domain: &str, ports: Vec<u16>) {
         // Try to resolve the domain using the system resolver
         let addr_str = format!("{}:0", domain);
         match addr_str.to_socket_addrs() {
             Ok(addrs) => {
-                let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                if ips.is_empty() {
+                let new_ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+                if new_ips.is_empty() {
                     debug!("DNS resolution returned no IPs for {}", domain);
                     return;
                 }
 
-                debug!(
-                    "caching resolved IPs for {}: {:?} (ports: {:?})",
-                    domain, ips, ports
-                );
-
-                let entry = DnsCacheEntry {
-                    ips,
-                    ports,
-                    expires_at: Instant::now() + DNS_CACHE_TTL,
-                };
-
-                if let Ok(mut cache) = self.dns_cache.write() {
-                    cache.insert(domain.to_string(), entry);
-                }
+                self.merge_into_cache(domain, &new_ips, ports);
             }
             Err(e) => {
                 warn!("failed to resolve {}: {}", domain, e);
             }
+        }
+    }
+
+    /// Merges new IPs into the cache entry for a domain.
+    /// Preserves existing IPs and resets the TTL.
+    fn merge_into_cache(&self, domain: &str, new_ips: &[IpAddr], ports: Vec<u16>) {
+        let Ok(mut cache) = self.dns_cache.write() else {
+            return;
+        };
+
+        let domain_key = domain.to_string();
+        let now = Instant::now();
+
+        if let Some(entry) = cache.get_mut(&domain_key) {
+            let before = entry.ips.len();
+            for ip in new_ips {
+                if !entry.ips.contains(ip) {
+                    entry.ips.push(*ip);
+                }
+            }
+            entry.updated_at = now;
+            // Merge port restrictions (use broader set)
+            if ports.is_empty() || entry.ports.is_empty() {
+                entry.ports = Vec::new(); // All ports
+            } else {
+                for p in &ports {
+                    if !entry.ports.contains(p) {
+                        entry.ports.push(*p);
+                    }
+                }
+            }
+            debug!(
+                "merged IPs for {}: {} -> {} entries",
+                domain,
+                before,
+                entry.ips.len()
+            );
+        } else {
+            debug!(
+                "caching resolved IPs for {}: {:?} (ports: {:?})",
+                domain, new_ips, ports
+            );
+            cache.insert(
+                domain_key,
+                DnsCacheEntry {
+                    ips: new_ips.to_vec(),
+                    ports,
+                    updated_at: now,
+                },
+            );
         }
     }
 
@@ -208,7 +247,7 @@ impl AllowList {
         let now = Instant::now();
         for entry in cache.values() {
             // Skip expired entries
-            if entry.expires_at < now {
+            if now.duration_since(entry.updated_at) > DNS_CACHE_TTL {
                 continue;
             }
 
@@ -280,7 +319,7 @@ impl AllowList {
         let now = Instant::now();
         if let Ok(mut cache) = self.dns_cache.write() {
             cache.retain(|domain, entry| {
-                let keep = entry.expires_at > now;
+                let keep = now.duration_since(entry.updated_at) <= DNS_CACHE_TTL;
                 if !keep {
                     debug!("expiring DNS cache entry for {}", domain);
                 }
@@ -300,20 +339,7 @@ impl AllowList {
             return;
         }
 
-        debug!(
-            "caching DoH resolution for {}: {:?} (ports: {:?})",
-            domain, addresses, ports
-        );
-
-        let entry = DnsCacheEntry {
-            ips: addresses.to_vec(),
-            ports,
-            expires_at: Instant::now() + DNS_CACHE_TTL,
-        };
-
-        if let Ok(mut cache) = self.dns_cache.write() {
-            cache.insert(domain.to_lowercase(), entry);
-        }
+        self.merge_into_cache(&domain.to_lowercase(), addresses, ports);
     }
 
     /// Checks if we should notify about a blocked target.
@@ -518,5 +544,64 @@ ip_ranges:
         let allowlist = AllowList::new(&test_config());
         assert!(allowlist.is_domain_allowed("API.GITHUB.COM", 443));
         assert!(allowlist.is_domain_allowed("Api.GitHub.Com", 443));
+    }
+
+    /// Tests that DNS cache merges IPs instead of replacing them.
+    /// When DNS returns different IPs on subsequent queries (round-robin),
+    /// previously cached IPs must remain valid.
+    #[test]
+    fn dns_cache_merges_ips() {
+        let config = AllowListConfig::parse(
+            r#"
+version: 1
+default_policy: deny
+domains:
+  - pattern: "rotating.example.com"
+    ports: [443]
+"#,
+        )
+        .unwrap();
+        let allowlist = AllowList::new(&config);
+
+        let ip_a = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let ip_b = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+        let ip_c = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3));
+
+        // First resolution returns [A, B]
+        allowlist.cache_doh_resolution("rotating.example.com", &[ip_a, ip_b], vec![443]);
+        assert!(allowlist.is_cached_ip_allowed(ip_a, 443));
+        assert!(allowlist.is_cached_ip_allowed(ip_b, 443));
+
+        // Second resolution returns [B, C] - A must still be valid
+        allowlist.cache_doh_resolution("rotating.example.com", &[ip_b, ip_c], vec![443]);
+        assert!(
+            allowlist.is_cached_ip_allowed(ip_a, 443),
+            "IP A lost after merge"
+        );
+        assert!(allowlist.is_cached_ip_allowed(ip_b, 443));
+        assert!(allowlist.is_cached_ip_allowed(ip_c, 443));
+    }
+
+    /// Tests that port restrictions are enforced on cached DNS entries.
+    #[test]
+    fn dns_cache_port_restriction() {
+        let config = AllowListConfig::parse(
+            r#"
+version: 1
+default_policy: deny
+domains:
+  - pattern: "secure.example.com"
+    ports: [443]
+"#,
+        )
+        .unwrap();
+        let allowlist = AllowList::new(&config);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        allowlist.cache_doh_resolution("secure.example.com", &[ip], vec![443]);
+
+        assert!(allowlist.is_cached_ip_allowed(ip, 443));
+        // Port 80 should not be allowed
+        assert!(!allowlist.is_cached_ip_allowed(ip, 80));
     }
 }
