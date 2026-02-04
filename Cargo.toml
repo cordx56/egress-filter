@@ -7,13 +7,6 @@ license = "MIT"
 keywords = ["seccomp", "network", "filter", "egress", "security"]
 categories = ["network-programming", "os::linux-apis"]
 
-[[bin]]
-name = "egress-filter"
-path = "src/bin/egress-filter.rs"
-
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
 libseccomp = "0.4"
 nix = { version = "0.31", features = ["process", "fs", "uio", "signal", "socket", "poll"] }
