@@ -203,6 +203,21 @@ impl<'a> NetworkHandler<'a> {
             dns_name: None,
         };
 
+        // Port 0 connect is used by glibc's getaddrinfo() for RFC 6724
+        // address sorting (determining source address via UDP routing probe).
+        // This is harmless and must be allowed for proper DNS resolution in
+        // runtimes that rely on getaddrinfo (e.g. Node.js).
+        if parsed.port() == 0 {
+            debug!(
+                "allowing port 0 connect to {} (address sorting probe)",
+                target.ip
+            );
+            self.handler.allow(notification)?;
+            return Ok(Decision::Skipped {
+                reason: "port 0 address sorting probe".into(),
+            });
+        }
+
         // Track DNS server connections for send() handling.
         // Record the **original** address before any rewrite.
         if parsed.port() == 53 {
