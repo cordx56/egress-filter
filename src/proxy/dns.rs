@@ -117,9 +117,9 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_TTL: Duration = Duration::from_secs(10);
 
 impl DnsProxyServer {
-    /// Binds the proxy to `127.0.0.1:0` (ephemeral port).
-    pub async fn bind(state: Arc<DnsProxyState>) -> Result<Self, std::io::Error> {
-        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    /// Binds the proxy to `127.0.0.1` on the given port (0 for ephemeral).
+    pub async fn bind(state: Arc<DnsProxyState>, port: u16) -> Result<Self, std::io::Error> {
+        let socket = UdpSocket::bind(("127.0.0.1", port)).await?;
         Ok(Self {
             socket: Arc::new(socket),
             state,

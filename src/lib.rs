@@ -83,6 +83,8 @@ pub struct Supervisor {
     config: AllowListConfig,
     /// Path to the configuration file for hot-reloading.
     config_path: Option<PathBuf>,
+    /// Port for the DNS proxy server (0 = ephemeral).
+    dns_proxy_port: u16,
 }
 
 /// Wrapper to implement AllowListChecker for AllowList
@@ -147,6 +149,7 @@ impl Supervisor {
             allowlist: Arc::new(RwLock::new(AllowList::new(&config))),
             config,
             config_path: None,
+            dns_proxy_port: 0,
         }
     }
 
@@ -156,7 +159,14 @@ impl Supervisor {
             allowlist: Arc::new(RwLock::new(AllowList::new(&config))),
             config,
             config_path: Some(path),
+            dns_proxy_port: 0,
         }
+    }
+
+    /// Sets the DNS proxy port (0 = ephemeral).
+    pub fn with_dns_proxy_port(mut self, port: u16) -> Self {
+        self.dns_proxy_port = port;
+        self
     }
 
     /// Runs the command with egress filtering.
@@ -408,7 +418,9 @@ impl Supervisor {
             .context("failed to create DNS proxy tokio runtime")?;
 
         let dns_server = dns_rt
-            .block_on(async { DnsProxyServer::bind(Arc::clone(&dns_proxy_state)).await })
+            .block_on(async {
+                DnsProxyServer::bind(Arc::clone(&dns_proxy_state), self.dns_proxy_port).await
+            })
             .context("failed to start DNS proxy server")?;
 
         let dns_proxy_addr = dns_server.local_addr()?;

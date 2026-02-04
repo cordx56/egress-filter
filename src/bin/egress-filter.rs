@@ -21,6 +21,10 @@ struct Args {
     #[arg(long, conflicts_with = "config")]
     allow_all: bool,
 
+    /// Port for the DNS proxy server (0 = auto-assign).
+    #[arg(short = 'p', long)]
+    dns_proxy_port: Option<u16>,
+
     /// Command to run with egress filtering.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
@@ -36,7 +40,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load or create allow list config
-    let supervisor = if args.allow_all {
+    let mut supervisor = if args.allow_all {
         let config = AllowListConfig::allow_all();
         Supervisor::new(config)
     } else {
@@ -48,6 +52,10 @@ fn main() -> Result<()> {
         // Use with_config_path to enable hot-reloading
         Supervisor::with_config_path(config, config_path)
     };
+
+    if let Some(port) = args.dns_proxy_port {
+        supervisor = supervisor.with_dns_proxy_port(port);
+    }
 
     // Run the command
     let exit_code = supervisor.run(&args.command)?;
