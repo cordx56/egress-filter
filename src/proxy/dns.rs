@@ -187,8 +187,13 @@ async fn handle_dns_query(
         query.original_server
     );
 
-    // Create a new socket for the upstream query
-    let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    // Create a new socket matching the upstream server's address family
+    let bind_addr: SocketAddr = if query.original_server.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let upstream_socket = UdpSocket::bind(bind_addr).await?;
     upstream_socket
         .send_to(packet, query.original_server)
         .await?;
