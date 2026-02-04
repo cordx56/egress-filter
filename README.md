@@ -8,6 +8,7 @@ It uses seccomp user notification to intercept network syscalls and enforce an a
 - Intercepts `connect`, `sendto`, `send`, and `sendmmsg`
 - Supports IPv4/IPv6 destination filtering
 - Domain-based filtering via DNS query parsing (UDP/53)
+- UDP DNS proxy for transparent DNS response interception and IP caching
 - YAML policy with:
   - `default_policy`
   - `domains` (exact and wildcard patterns like `*.example.com`)
@@ -94,9 +95,19 @@ Field notes:
 - `dns.allow_authoritative`: allow DNS server connects (port 53) to any IP
 - `doh.enabled`: enables HTTPS proxy + DoH request inspection
 
+## DNS Proxy
+
+The supervisor always starts a local UDP DNS proxy. When the child process sends a DNS query (port 53), the seccomp handler intercepts the syscall, rewrites the destination to the local proxy, and allows it through. The proxy then:
+
+1. Forwards the query to the original upstream DNS server
+2. Parses A/AAAA records from the response and caches the resolved IPs
+3. Returns the unmodified response to the child process
+
+This ensures that resolved IPs are already cached when the child later calls `connect()`, enabling immediate allow/deny decisions. It also works reliably with stub resolvers like systemd-resolved, where the supervisor cannot observe the actual DNS response otherwise.
+
 ## DoH Mode
 
-When `doh.enabled: true`, the supervisor:
+When `doh.enabled: true`, the supervisor additionally:
 
 - starts a local TLS-terminating proxy
 - generates an ephemeral CA certificate
@@ -109,7 +120,7 @@ When `doh.enabled: true`, the supervisor:
 - inspects DoH queries against the allow list
 
 When `doh.enabled: false`, DoH MITM/inspection and CA injection are disabled.
-Normal syscall-level destination filtering is still active.
+The DNS proxy and syscall-level destination filtering remain active regardless of this setting.
 
 ## Hot-Reload
 

@@ -44,7 +44,7 @@ rcgen = "0.14"
 time = "0.3"
 
 # Async runtime
-tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 
 # Utilities
 base64 = "0.22"

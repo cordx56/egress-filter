@@ -110,6 +110,20 @@ impl AllowList {
         }
     }
 
+    /// Returns the allowed ports for a domain if it matches any rule.
+    /// Returns an empty Vec if no rule matches (not allowed).
+    pub fn get_domain_ports(&self, domain: &str) -> Vec<u16> {
+        let domain_lower = domain.to_lowercase();
+
+        for rule in &self.domains {
+            if rule.matches(&domain_lower) {
+                return rule.allowed_ports();
+            }
+        }
+
+        Vec::new()
+    }
+
     /// Checks if a domain:port is allowed.
     /// If allowed, tracks the domain for future IP lookups.
     pub fn is_domain_allowed(&self, domain: &str, port: u16) -> bool {

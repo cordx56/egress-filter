@@ -41,7 +41,9 @@ pub mod proxy;
 mod seccomp;
 
 pub use allowlist::{AllowList, AllowListConfig, AllowListError, DnsConfig, DohConfig};
-pub use network::{ConnectionTarget, Decision, DnsQuery, NetworkHandler, ProxyRedirect};
+pub use network::{
+    ConnectionTarget, Decision, DnsQuery, DnsRedirect, NetworkHandler, ProxyRedirect,
+};
 pub use seccomp::{NotificationHandler, ProcessMemory, SeccompFilter, SyscallNotification};
 
 // Re-export InterceptedSyscall for handlers
@@ -70,7 +72,10 @@ use tracing::{debug, error, info, warn};
 use config_watcher::ConfigEvent;
 
 use ca::CaState;
-use proxy::{AllowListChecker, ProxyServer, ProxyState, ResolutionCache};
+use proxy::{
+    AllowListChecker, DnsProxyServer, DnsProxyState, PendingDnsQuery, ProxyServer, ProxyState,
+    ResolutionCache,
+};
 
 /// Supervisor that runs a command under egress filtering.
 pub struct Supervisor {
@@ -393,7 +398,45 @@ impl Supervisor {
             None
         };
 
-        self.supervisor_loop(child, notify_fd, proxy_redirect, signal_fd)
+        // Start DNS proxy (always active, independent of DoH)
+        let resolution_cache = Arc::new(ResolutionCacheWrapper(Arc::clone(&self.allowlist)));
+        let dns_proxy_state = Arc::new(DnsProxyState::new(resolution_cache));
+
+        let dns_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create DNS proxy tokio runtime")?;
+
+        let dns_server = dns_rt
+            .block_on(async { DnsProxyServer::bind(Arc::clone(&dns_proxy_state)).await })
+            .context("failed to start DNS proxy server")?;
+
+        let dns_proxy_addr = dns_server.local_addr()?;
+        info!("DNS proxy listening on {}", dns_proxy_addr);
+
+        std::thread::spawn(move || {
+            dns_rt.block_on(async {
+                if let Err(e) = dns_server.run().await {
+                    error!("DNS proxy server error: {}", e);
+                }
+            });
+        });
+
+        let dns_state_for_redirect = dns_proxy_state;
+        let dns_redirect = DnsRedirect {
+            proxy_addr: dns_proxy_addr,
+            register_query: Arc::new(move |query: PendingDnsQuery| {
+                dns_state_for_redirect.register_query(query);
+            }),
+        };
+
+        self.supervisor_loop(
+            child,
+            notify_fd,
+            proxy_redirect,
+            Some(dns_redirect),
+            signal_fd,
+        )
     }
 
     fn supervisor_loop(
@@ -401,6 +444,7 @@ impl Supervisor {
         child: Pid,
         notify_fd: OwnedFd,
         proxy_redirect: Option<ProxyRedirect>,
+        dns_redirect: Option<DnsRedirect>,
         signal_fd: SignalFd,
     ) -> Result<i32> {
         let handler = NotificationHandler::new(notify_fd);
@@ -409,6 +453,11 @@ impl Supervisor {
         // Configure proxy redirect if enabled
         if let Some(redirect) = proxy_redirect {
             network_handler = network_handler.with_proxy_redirect(redirect);
+        }
+
+        // Configure DNS proxy redirect
+        if let Some(redirect) = dns_redirect {
+            network_handler = network_handler.with_dns_redirect(redirect);
         }
 
         // Start config watcher if a config path was provided

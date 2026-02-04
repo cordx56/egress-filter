@@ -33,6 +33,8 @@ pub struct DnsQuery {
     pub name: String,
     /// Query type (A=1, AAAA=28, etc).
     pub qtype: u16,
+    /// DNS transaction ID.
+    pub txid: u16,
 }
 
 /// Low-level DNS name parser that operates on byte slices.
@@ -126,6 +128,7 @@ impl DnsNameParser {
             return Err(DnsError::TooShort(packet.len()));
         }
 
+        let txid = u16::from_be_bytes([packet[0], packet[1]]);
         let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
         if qdcount == 0 {
             return Err(DnsError::NoQuestions);
@@ -141,11 +144,23 @@ impl DnsNameParser {
 
         let qtype = u16::from_be_bytes([packet[end_offset], packet[end_offset + 1]]);
 
-        Ok(DnsQuery { name, qtype })
+        Ok(DnsQuery { name, qtype, txid })
     }
 }
 
 impl DnsQuery {
+    /// Reads the DNS transaction ID from a UDP packet buffer in the target process.
+    pub fn read_txid(mem: &ProcessMemory, buf_ptr: u64, buf_len: usize) -> Result<u16, DnsError> {
+        if buf_len < 2 {
+            return Err(DnsError::TooShort(buf_len));
+        }
+
+        let mut buf = [0u8; 2];
+        mem.read(buf_ptr, &mut buf)?;
+
+        Ok(u16::from_be_bytes(buf))
+    }
+
     /// Parses a DNS query from a UDP packet buffer in the target process.
     ///
     /// # Arguments
@@ -192,6 +207,7 @@ mod tests {
         let query = DnsNameParser::parse_query(&packet).unwrap();
         assert_eq!(query.name, "example.com");
         assert_eq!(query.qtype, 1);
+        assert_eq!(query.txid, 0x1234);
     }
 
     /// Tests parsing a DNS name with compression pointer.

@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use crate::allowlist::AllowList;
+use crate::proxy::PendingDnsQuery;
 use crate::seccomp::{InterceptedSyscall, NotificationHandler, ProcessMemory, SyscallNotification};
 
 use super::dns::DnsQuery;
@@ -60,6 +61,15 @@ pub struct ProxyRedirect {
     pub register_destination: Arc<dyn Fn(SocketAddr) + Send + Sync>,
 }
 
+/// Configuration for the DNS proxy redirect.
+#[derive(Clone)]
+pub struct DnsRedirect {
+    /// The local DNS proxy address to redirect to.
+    pub proxy_addr: SocketAddr,
+    /// Callback to register a pending DNS query with the proxy.
+    pub register_query: Arc<dyn Fn(PendingDnsQuery) + Send + Sync>,
+}
+
 /// Tracks connected sockets for send() handling.
 /// Maps (pid, fd) -> destination address.
 #[derive(Default)]
@@ -89,12 +99,24 @@ impl SocketTracker {
     }
 }
 
+struct DnsSendtoContext<'a> {
+    mem: &'a ProcessMemory,
+    notification: &'a SyscallNotification,
+    target: &'a ConnectionTarget,
+    original_server: SocketAddr,
+    dest_addr_ptr: u64,
+    addr_len: u32,
+    txid: Option<u16>,
+}
+
 /// Handles network-related syscall notifications.
 pub struct NetworkHandler<'a> {
     handler: &'a NotificationHandler,
     allowlist: Arc<RwLock<AllowList>>,
     /// Proxy redirect configuration (if DoH interception is enabled).
     proxy_redirect: Option<ProxyRedirect>,
+    /// DNS proxy redirect configuration.
+    dns_redirect: Option<DnsRedirect>,
     /// Tracks connected sockets for send() handling.
     socket_tracker: SocketTracker,
 }
@@ -105,6 +127,7 @@ impl<'a> NetworkHandler<'a> {
             handler,
             allowlist,
             proxy_redirect: None,
+            dns_redirect: None,
             socket_tracker: SocketTracker::new(),
         }
     }
@@ -117,6 +140,12 @@ impl<'a> NetworkHandler<'a> {
     /// Sets the proxy redirect configuration for TLS interception.
     pub fn with_proxy_redirect(mut self, redirect: ProxyRedirect) -> Self {
         self.proxy_redirect = Some(redirect);
+        self
+    }
+
+    /// Sets the DNS proxy redirect configuration.
+    pub fn with_dns_redirect(mut self, redirect: DnsRedirect) -> Self {
+        self.dns_redirect = Some(redirect);
         self
     }
 
@@ -171,7 +200,8 @@ impl<'a> NetworkHandler<'a> {
             dns_name: None,
         };
 
-        // Track DNS server connections for send() handling
+        // Track DNS server connections for send() handling.
+        // Record the **original** address before any rewrite.
         if parsed.port() == 53 {
             let fd = notification.args[0] as i32;
             self.socket_tracker.track(notification.pid, fd, parsed.addr);
@@ -179,6 +209,28 @@ impl<'a> NetworkHandler<'a> {
                 "tracking DNS socket: pid={} fd={} -> {}",
                 notification.pid, fd, parsed.addr
             );
+
+            // Redirect to the local DNS proxy if configured
+            if let Some(ref dns_redirect) = self.dns_redirect {
+                if let Err(e) =
+                    SocketAddress::write(mem, addr_ptr, addr_len, dns_redirect.proxy_addr)
+                {
+                    warn!("failed to rewrite DNS sockaddr: {}", e);
+                } else {
+                    info!(
+                        "redirected DNS {}:{} to proxy {}",
+                        target.ip, target.port, dns_redirect.proxy_addr
+                    );
+                    self.handler.allow(notification)?;
+                    return Ok(Decision::Allowed {
+                        target: ConnectionTarget {
+                            ip: target.ip,
+                            port: target.port,
+                            dns_name: Some("redirected to DNS proxy".to_string()),
+                        },
+                    });
+                }
+            }
         }
 
         // Check if we should redirect to proxy (port 443 with DoH enabled)
@@ -263,8 +315,10 @@ impl<'a> NetworkHandler<'a> {
 
         // If this is DNS (port 53), handle as a DNS query
         if parsed.is_dns && buf_len > 0 {
+            let mut txid = None;
             let dns_name = match DnsQuery::parse(mem, buf_ptr, buf_len) {
                 Ok(query) => {
+                    txid = Some(query.txid);
                     debug!("DNS query for: {}", query.name);
                     Some(query.name)
                 }
@@ -273,6 +327,9 @@ impl<'a> NetworkHandler<'a> {
                     None
                 }
             };
+            if txid.is_none() {
+                txid = DnsQuery::read_txid(mem, buf_ptr, buf_len).ok();
+            }
 
             let target = ConnectionTarget {
                 ip: parsed.ip(),
@@ -280,7 +337,15 @@ impl<'a> NetworkHandler<'a> {
                 dns_name,
             };
 
-            return self.decide_dns_query(notification, &target);
+            return self.decide_dns_sendto(DnsSendtoContext {
+                mem,
+                notification,
+                target: &target,
+                original_server: parsed.addr,
+                dest_addr_ptr,
+                addr_len,
+                txid,
+            });
         }
 
         let target = ConnectionTarget {
@@ -292,23 +357,53 @@ impl<'a> NetworkHandler<'a> {
         self.decide_and_respond(notification, &target, &parsed)
     }
 
-    /// Decides whether to allow or deny a DNS query.
-    /// Uses `is_dns_query_allowed` which checks domain rules without port restriction,
-    /// since the target port here is the DNS server port (53), not the service port.
-    fn decide_dns_query(
-        &self,
-        notification: &SyscallNotification,
-        target: &ConnectionTarget,
-    ) -> Result<Decision, HandlerError> {
+    /// Decides whether to allow or deny a DNS query from sendto().
+    /// If allowed and DNS proxy is configured, registers the query and
+    /// rewrites the destination to the proxy.
+    fn decide_dns_sendto(&self, ctx: DnsSendtoContext<'_>) -> Result<Decision, HandlerError> {
+        let DnsSendtoContext {
+            mem,
+            notification,
+            target,
+            original_server,
+            dest_addr_ptr,
+            addr_len,
+            txid,
+        } = ctx;
         let allowlist = self.allowlist.read().unwrap();
-        let allowed = if let Some(ref name) = target.dns_name {
-            allowlist.is_dns_query_allowed(name)
+        let (allowed, ports) = if let Some(ref name) = target.dns_name {
+            let ports = allowlist.get_domain_ports(name);
+            (allowlist.is_dns_query_allowed(name), ports)
         } else {
-            // Can't parse DNS query, fall back to IP check
-            allowlist.is_ip_allowed(target.ip, target.port)
+            (allowlist.is_ip_allowed(target.ip, target.port), Vec::new())
         };
+        drop(allowlist);
 
         if allowed {
+            // Register with DNS proxy and rewrite destination if configured
+            if let Some(ref dns_redirect) = self.dns_redirect
+                && let Some(txid) = txid
+            {
+                (dns_redirect.register_query)(PendingDnsQuery {
+                    original_server,
+                    domain: target.dns_name.clone(),
+                    ports,
+                    txid,
+                });
+
+                if let Err(e) =
+                    SocketAddress::write(mem, dest_addr_ptr, addr_len, dns_redirect.proxy_addr)
+                {
+                    warn!("failed to rewrite DNS sendto dest: {}", e);
+                } else {
+                    info!("allowed: {} (DNS sendto, redirected to proxy)", target);
+                    self.handler.allow(notification)?;
+                    return Ok(Decision::Allowed {
+                        target: target.clone(),
+                    });
+                }
+            }
+
             info!("allowed: {} (DNS query)", target);
             self.handler.allow(notification)?;
             Ok(Decision::Allowed {
@@ -316,9 +411,62 @@ impl<'a> NetworkHandler<'a> {
             })
         } else {
             info!("denied: {} (DNS query)", target);
-            if allowlist.should_notify_block(target.ip, target.port) {
+            let al = self.allowlist.read().unwrap();
+            if al.should_notify_block(target.ip, target.port) {
                 eprintln!("[egress-filter] DNS query blocked: {}", target);
             }
+            drop(al);
+            self.handler.deny(notification)?;
+            Ok(Decision::Denied {
+                target: target.clone(),
+            })
+        }
+    }
+
+    /// Decides whether to allow or deny a DNS query from send()/sendmmsg().
+    /// These use connected sockets already pointing to the proxy, so no
+    /// destination rewrite is needed, but we still register the pending query.
+    fn decide_dns_query(
+        &self,
+        notification: &SyscallNotification,
+        target: &ConnectionTarget,
+        original_server: SocketAddr,
+        txid: Option<u16>,
+    ) -> Result<Decision, HandlerError> {
+        let allowlist = self.allowlist.read().unwrap();
+        let (allowed, ports) = if let Some(ref name) = target.dns_name {
+            let ports = allowlist.get_domain_ports(name);
+            (allowlist.is_dns_query_allowed(name), ports)
+        } else {
+            (allowlist.is_ip_allowed(target.ip, target.port), Vec::new())
+        };
+        drop(allowlist);
+
+        if allowed {
+            // Register with DNS proxy if configured
+            if let Some(ref dns_redirect) = self.dns_redirect
+                && let Some(txid) = txid
+            {
+                (dns_redirect.register_query)(PendingDnsQuery {
+                    original_server,
+                    domain: target.dns_name.clone(),
+                    ports,
+                    txid,
+                });
+            }
+
+            info!("allowed: {} (DNS query)", target);
+            self.handler.allow(notification)?;
+            Ok(Decision::Allowed {
+                target: target.clone(),
+            })
+        } else {
+            info!("denied: {} (DNS query)", target);
+            let al = self.allowlist.read().unwrap();
+            if al.should_notify_block(target.ip, target.port) {
+                eprintln!("[egress-filter] DNS query blocked: {}", target);
+            }
+            drop(al);
             self.handler.deny(notification)?;
             Ok(Decision::Denied {
                 target: target.clone(),
@@ -488,8 +636,10 @@ impl<'a> NetworkHandler<'a> {
         }
 
         // Parse DNS query from the buffer
+        let mut txid = None;
         let dns_name = match DnsQuery::parse(mem, iov_base, iov_len as usize) {
             Ok(query) => {
+                txid = Some(query.txid);
                 debug!("DNS query (sendmmsg) for: {}", query.name);
                 Some(query.name)
             }
@@ -498,6 +648,9 @@ impl<'a> NetworkHandler<'a> {
                 None
             }
         };
+        if txid.is_none() {
+            txid = DnsQuery::read_txid(mem, iov_base, iov_len as usize).ok();
+        }
 
         let target = ConnectionTarget {
             ip: dest.ip(),
@@ -505,7 +658,7 @@ impl<'a> NetworkHandler<'a> {
             dns_name,
         };
 
-        self.decide_dns_query(notification, &target)
+        self.decide_dns_query(notification, &target, dest, txid)
     }
 
     /// Handles send(fd, buf, len, flags) syscall for connected sockets.
@@ -552,8 +705,10 @@ impl<'a> NetworkHandler<'a> {
         }
 
         // Parse DNS query
+        let mut txid = None;
         let dns_name = match DnsQuery::parse(mem, buf_ptr, buf_len) {
             Ok(query) => {
+                txid = Some(query.txid);
                 debug!("DNS query (send) for: {}", query.name);
                 Some(query.name)
             }
@@ -562,6 +717,9 @@ impl<'a> NetworkHandler<'a> {
                 None
             }
         };
+        if txid.is_none() {
+            txid = DnsQuery::read_txid(mem, buf_ptr, buf_len).ok();
+        }
 
         let target = ConnectionTarget {
             ip: dest.ip(),
@@ -569,6 +727,6 @@ impl<'a> NetworkHandler<'a> {
             dns_name,
         };
 
-        self.decide_dns_query(notification, &target)
+        self.decide_dns_query(notification, &target, dest, txid)
     }
 }
