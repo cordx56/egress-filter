@@ -430,29 +430,34 @@ impl<'a> NetworkHandler<'a> {
 
         if allowed {
             // Register with DNS proxy and rewrite destination if configured
-            if let Some(ref dns_redirect) = self.dns_redirect
-                && let Some(txid) = txid
-            {
-                (dns_redirect.register_query)(PendingDnsQuery {
-                    original_server,
-                    domain: target.dns_name.clone(),
-                    ports,
-                    txid,
-                });
-
-                let proxy_addr = if target.ip.is_ipv6() {
-                    dns_redirect.proxy_addr_v6
-                } else {
-                    dns_redirect.proxy_addr_v4
-                };
-                if let Err(e) = SocketAddress::write(mem, dest_addr_ptr, addr_len, proxy_addr) {
-                    warn!("failed to rewrite DNS sendto dest: {}", e);
-                } else {
-                    info!("allowed: {} (DNS sendto, redirected to proxy)", target);
-                    self.handler.allow(notification)?;
-                    return Ok(Decision::Allowed {
-                        target: target.clone(),
+            if let Some(ref dns_redirect) = self.dns_redirect {
+                if let Some(txid) = txid {
+                    (dns_redirect.register_query)(PendingDnsQuery {
+                        original_server,
+                        domain: target.dns_name.clone(),
+                        ports,
+                        txid,
                     });
+
+                    let proxy_addr = if target.ip.is_ipv6() {
+                        dns_redirect.proxy_addr_v6
+                    } else {
+                        dns_redirect.proxy_addr_v4
+                    };
+                    if let Err(e) = SocketAddress::write(mem, dest_addr_ptr, addr_len, proxy_addr) {
+                        warn!("failed to rewrite DNS sendto dest: {}", e);
+                    } else {
+                        info!("allowed: {} (DNS sendto, redirected to proxy)", target);
+                        self.handler.allow(notification)?;
+                        return Ok(Decision::Allowed {
+                            target: target.clone(),
+                        });
+                    }
+                } else {
+                    warn!(
+                        "DNS sendto allowed but missing txid; skipping proxy redirect for {}",
+                        target
+                    );
                 }
             }
 
@@ -496,15 +501,20 @@ impl<'a> NetworkHandler<'a> {
 
         if allowed {
             // Register with DNS proxy if configured
-            if let Some(ref dns_redirect) = self.dns_redirect
-                && let Some(txid) = txid
-            {
-                (dns_redirect.register_query)(PendingDnsQuery {
-                    original_server,
-                    domain: target.dns_name.clone(),
-                    ports,
-                    txid,
-                });
+            if let Some(ref dns_redirect) = self.dns_redirect {
+                if let Some(txid) = txid {
+                    (dns_redirect.register_query)(PendingDnsQuery {
+                        original_server,
+                        domain: target.dns_name.clone(),
+                        ports,
+                        txid,
+                    });
+                } else {
+                    warn!(
+                        "DNS query allowed but missing txid; skipping proxy registration for {}",
+                        target
+                    );
+                }
             }
 
             info!("allowed: {} (DNS query)", target);
@@ -530,17 +540,9 @@ impl<'a> NetworkHandler<'a> {
         &self,
         notification: &SyscallNotification,
         target: &ConnectionTarget,
-        parsed: &ParsedAddress,
+        _parsed: &ParsedAddress,
     ) -> Result<Decision, HandlerError> {
         let allowlist = self.allowlist.read().unwrap();
-
-        if parsed.is_dns && allowlist.allow_authoritative_dns() {
-            info!("allowed: {} (DNS server connect)", target);
-            self.handler.allow(notification)?;
-            return Ok(Decision::Allowed {
-                target: target.clone(),
-            });
-        }
 
         let allowed = if let Some(ref dns_name) = target.dns_name {
             allowlist.is_domain_allowed(dns_name, target.port)

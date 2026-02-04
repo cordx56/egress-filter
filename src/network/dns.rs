@@ -1,5 +1,6 @@
 use crate::seccomp::ProcessMemory;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum DnsError {
@@ -18,7 +19,8 @@ pub enum DnsError {
 }
 
 /// Maximum size of a DNS packet we'll read.
-const MAX_DNS_PACKET_SIZE: usize = 512;
+/// EDNS0 allows larger UDP payloads; 4096 is a common upper bound.
+const MAX_DNS_PACKET_SIZE: usize = 4096;
 
 /// Maximum length of a domain name.
 const MAX_DOMAIN_LEN: usize = 253;
@@ -146,6 +148,32 @@ impl DnsNameParser {
 
         Ok(DnsQuery { name, qtype, txid })
     }
+
+    /// Parses the first DNS query, handling TCP length-prefixed messages when needed.
+    pub fn parse_query_lenient(packet: &[u8]) -> Result<DnsQuery, DnsError> {
+        match Self::parse_query(packet) {
+            Ok(query) => Ok(query),
+            Err(err) => {
+                if packet.len() < 14 {
+                    return Err(err);
+                }
+
+                let declared_len = u16::from_be_bytes([packet[0], packet[1]]) as usize;
+                if declared_len == 0 || declared_len + 2 > packet.len() {
+                    return Err(err);
+                }
+
+                let trimmed = &packet[2..2 + declared_len];
+                let query = Self::parse_query(trimmed)?;
+                debug!(
+                    "parsed length-prefixed DNS query (declared_len={}, actual_len={})",
+                    declared_len,
+                    packet.len() - 2
+                );
+                Ok(query)
+            }
+        }
+    }
 }
 
 impl DnsQuery {
@@ -176,7 +204,7 @@ impl DnsQuery {
         let mut buf = vec![0u8; read_len];
         mem.read(buf_ptr, &mut buf)?;
 
-        DnsNameParser::parse_query(&buf)
+        DnsNameParser::parse_query_lenient(&buf)
     }
 }
 

@@ -138,10 +138,12 @@ pub struct DnsQuery {
 
 /// Parses a DNS query from wire format using the shared parser.
 fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
-    DnsNameParser::parse_query(packet).ok().map(|q| DnsQuery {
-        name: q.name,
-        qtype: q.qtype,
-    })
+    DnsNameParser::parse_query_lenient(packet)
+        .ok()
+        .map(|q| DnsQuery {
+            name: q.name,
+            qtype: q.qtype,
+        })
 }
 
 /// A parsed DNS response.

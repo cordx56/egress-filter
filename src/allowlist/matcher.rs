@@ -27,7 +27,6 @@ pub struct AllowList {
     default_policy: DefaultPolicy,
     domains: Vec<CompiledDomainRule>,
     ip_ranges: Vec<CompiledIpRule>,
-    allow_authoritative_dns: bool,
     /// Cache of resolved DNS names -> IPs.
     /// Key is the domain name, value is the resolved IPs and allowed ports.
     dns_cache: RwLock<HashMap<String, DnsCacheEntry>>,
@@ -83,7 +82,6 @@ impl AllowList {
             default_policy: config.default_policy,
             domains,
             ip_ranges,
-            allow_authoritative_dns: config.dns.allow_authoritative,
             dns_cache: RwLock::new(HashMap::new()),
             notified_blocks: RwLock::new(HashMap::new()),
         };
@@ -184,11 +182,6 @@ impl AllowList {
         }
 
         self.default_policy == DefaultPolicy::Allow
-    }
-
-    /// Returns whether outbound DNS server connections are allowed to any IP.
-    pub fn allow_authoritative_dns(&self) -> bool {
-        self.allow_authoritative_dns
     }
 
     /// Ensures a domain is tracked in the cache with its allowed ports.

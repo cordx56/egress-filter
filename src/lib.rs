@@ -40,7 +40,7 @@ mod network;
 pub mod proxy;
 mod seccomp;
 
-pub use allowlist::{AllowList, AllowListConfig, AllowListError, DnsConfig, DohConfig};
+pub use allowlist::{AllowList, AllowListConfig, AllowListError, DohConfig};
 pub use network::{
     ConnectionTarget, Decision, DnsQuery, DnsRedirect, NetworkHandler, ProxyRedirect,
 };

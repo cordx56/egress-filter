@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,7 @@ pub struct DnsProxyServer {
     socket_v4: Arc<UdpSocket>,
     socket_v6: Option<Arc<UdpSocket>>,
     state: Arc<DnsProxyState>,
+    inflight: Arc<AtomicUsize>,
 }
 
 /// Buffer size for DNS packets (EDNS0 supports up to 4096).
@@ -117,6 +119,24 @@ const DNS_BUF_SIZE: usize = 4096;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time to keep pending DNS queries.
 const PENDING_TTL: Duration = Duration::from_secs(10);
+/// Warn when in-flight DNS proxy tasks exceed this count.
+const DNS_INFLIGHT_WARN: usize = 128;
+
+struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InflightGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 impl DnsProxyServer {
     /// Binds the proxy on `127.0.0.1` and, when available, `[::1]` with the
@@ -143,6 +163,7 @@ impl DnsProxyServer {
             socket_v4: Arc::new(socket_v4),
             socket_v6,
             state,
+            inflight: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -200,8 +221,14 @@ impl DnsProxyServer {
             let pending = self.state.take_query(txid, name.as_deref());
             let socket = Arc::clone(socket);
             let state = Arc::clone(&self.state);
+            let inflight = Arc::clone(&self.inflight);
+            let inflight_now = inflight.fetch_add(1, Ordering::Relaxed) + 1;
+            if inflight_now >= DNS_INFLIGHT_WARN && inflight_now.is_multiple_of(DNS_INFLIGHT_WARN) {
+                warn!("DNS proxy in-flight tasks: {}", inflight_now);
+            }
 
             tokio::spawn(async move {
+                let _guard = InflightGuard::new(inflight);
                 if let Err(e) =
                     handle_dns_query(&socket, &state, child_addr, &packet, pending).await
                 {
@@ -347,7 +374,7 @@ fn extract_txid(packet: &[u8]) -> Option<u16> {
 }
 
 fn extract_query_name(packet: &[u8]) -> Option<String> {
-    crate::network::DnsNameParser::parse_query(packet)
+    crate::network::DnsNameParser::parse_query_lenient(packet)
         .ok()
         .map(|query| query.name)
 }

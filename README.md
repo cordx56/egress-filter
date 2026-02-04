@@ -13,7 +13,6 @@ It uses seccomp user notification to intercept network syscalls and enforce an a
   - `default_policy`
   - `domains` (exact and wildcard patterns like `*.example.com`)
   - `ip_ranges` (CIDR or single IP)
-  - `dns.allow_authoritative`
   - `doh.enabled`
 - DNS resolution caching for allowed domains
 - Optional DoH inspection mode (`doh.enabled: true`)
@@ -54,11 +53,6 @@ Example `egress-allowlist.yaml`:
 version: 1
 default_policy: deny
 
-dns:
-  # Allow outbound DNS server connections (port 53) to any IP.
-  # Useful for iterative resolvers that contact authoritative servers directly.
-  allow_authoritative: false
-
 doh:
   enabled: true
 
@@ -92,7 +86,6 @@ Field notes:
 - `domains[].ports`: `null` (or omitted) means all ports
 - `ip_ranges[].cidr`: CIDR or single IP
 - `ip_ranges[].ports`: `null` (or omitted) means all ports
-- `dns.allow_authoritative`: allow DNS server connects (port 53) to any IP
 - `doh.enabled`: enables HTTPS proxy + DoH request inspection
 
 ## DNS Proxy

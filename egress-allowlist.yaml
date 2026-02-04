@@ -1,9 +1,6 @@
 version: 1
 default_policy: deny
 
-dns:
-  allow_authoritative: false
-
 doh:
   enabled: false
 
@@ -53,7 +50,7 @@ ip_ranges:
     ports: [53, 443]
   - cidr: "1.0.0.1/32"
     ports: [53, 443]
-  - cidr: "104.16.0.0/12"
-    ports: [443]
-  - cidr: "2606:4700::/32"
+  - cidr: "2606:4700:4700::1111/128"
+    ports: [53, 443]
+  - cidr: "2606:4700:4700::1001/128"
     ports: [53, 443]
