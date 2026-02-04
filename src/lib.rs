@@ -423,8 +423,12 @@ impl Supervisor {
             })
             .context("failed to start DNS proxy server")?;
 
-        let dns_proxy_addr = dns_server.local_addr()?;
-        info!("DNS proxy listening on {}", dns_proxy_addr);
+        let dns_proxy_addr_v4 = dns_server.local_addr_v4()?;
+        let dns_proxy_addr_v6 = dns_server.local_addr_v6()?;
+        info!(
+            "DNS proxy listening on {} and {}",
+            dns_proxy_addr_v4, dns_proxy_addr_v6
+        );
 
         std::thread::spawn(move || {
             dns_rt.block_on(async {
@@ -436,7 +440,8 @@ impl Supervisor {
 
         let dns_state_for_redirect = dns_proxy_state;
         let dns_redirect = DnsRedirect {
-            proxy_addr: dns_proxy_addr,
+            proxy_addr_v4: dns_proxy_addr_v4,
+            proxy_addr_v6: dns_proxy_addr_v6,
             register_query: Arc::new(move |query: PendingDnsQuery| {
                 dns_state_for_redirect.register_query(query);
             }),

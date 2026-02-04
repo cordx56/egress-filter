@@ -65,8 +65,10 @@ pub struct ProxyRedirect {
 /// Configuration for the DNS proxy redirect.
 #[derive(Clone)]
 pub struct DnsRedirect {
-    /// The local DNS proxy address to redirect to.
-    pub proxy_addr: SocketAddr,
+    /// The local DNS proxy address to redirect to (IPv4).
+    pub proxy_addr_v4: SocketAddr,
+    /// The local DNS proxy address to redirect to (IPv6).
+    pub proxy_addr_v6: SocketAddr,
     /// Callback to register a pending DNS query with the proxy.
     pub register_query: Arc<dyn Fn(PendingDnsQuery) + Send + Sync>,
 }
@@ -213,14 +215,17 @@ impl<'a> NetworkHandler<'a> {
 
             // Redirect to the local DNS proxy if configured
             if let Some(ref dns_redirect) = self.dns_redirect {
-                if let Err(e) =
-                    SocketAddress::write(mem, addr_ptr, addr_len, dns_redirect.proxy_addr)
-                {
+                let proxy_addr = if target.ip.is_ipv6() {
+                    dns_redirect.proxy_addr_v6
+                } else {
+                    dns_redirect.proxy_addr_v4
+                };
+                if let Err(e) = SocketAddress::write(mem, addr_ptr, addr_len, proxy_addr) {
                     warn!("failed to rewrite DNS sockaddr: {}", e);
                 } else {
                     info!(
                         "redirected DNS {}:{} to proxy {}",
-                        target.ip, target.port, dns_redirect.proxy_addr
+                        target.ip, target.port, proxy_addr
                     );
                     self.handler.allow(notification)?;
                     return Ok(Decision::Allowed {
@@ -435,9 +440,12 @@ impl<'a> NetworkHandler<'a> {
                     txid,
                 });
 
-                if let Err(e) =
-                    SocketAddress::write(mem, dest_addr_ptr, addr_len, dns_redirect.proxy_addr)
-                {
+                let proxy_addr = if target.ip.is_ipv6() {
+                    dns_redirect.proxy_addr_v6
+                } else {
+                    dns_redirect.proxy_addr_v4
+                };
+                if let Err(e) = SocketAddress::write(mem, dest_addr_ptr, addr_len, proxy_addr) {
                     warn!("failed to rewrite DNS sendto dest: {}", e);
                 } else {
                     info!("allowed: {} (DNS sendto, redirected to proxy)", target);

@@ -101,10 +101,12 @@ impl DnsProxyState {
 }
 
 /// UDP DNS proxy server.
-/// Listens on a local ephemeral port and forwards DNS queries to the
-/// original upstream DNS server, caching A/AAAA records from responses.
+/// Listens on local IPv4 and IPv6 loopback addresses and forwards DNS
+/// queries to the original upstream DNS server, caching A/AAAA records
+/// from responses.
 pub struct DnsProxyServer {
-    socket: Arc<UdpSocket>,
+    socket_v4: Arc<UdpSocket>,
+    socket_v6: Option<Arc<UdpSocket>>,
     state: Arc<DnsProxyState>,
 }
 
@@ -117,27 +119,75 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const PENDING_TTL: Duration = Duration::from_secs(10);
 
 impl DnsProxyServer {
-    /// Binds the proxy to `127.0.0.1` on the given port (0 for ephemeral).
+    /// Binds the proxy on `127.0.0.1` and, when available, `[::1]` with the
+    /// given port (0 for ephemeral). When `port` is 0, the IPv6 socket reuses
+    /// the port assigned to the IPv4 socket so both share the same port number.
     pub async fn bind(state: Arc<DnsProxyState>, port: u16) -> Result<Self, std::io::Error> {
-        let socket = UdpSocket::bind(("127.0.0.1", port)).await?;
+        let socket_v4 = UdpSocket::bind(("127.0.0.1", port)).await?;
+        let v6_port = if port == 0 {
+            socket_v4.local_addr()?.port()
+        } else {
+            port
+        };
+        let socket_v6 = match UdpSocket::bind(("::1", v6_port)).await {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(err) => {
+                warn!(
+                    "failed to bind DNS proxy on [::1]:{}, falling back to IPv4 only: {}",
+                    v6_port, err
+                );
+                None
+            }
+        };
         Ok(Self {
-            socket: Arc::new(socket),
+            socket_v4: Arc::new(socket_v4),
+            socket_v6,
             state,
         })
     }
 
-    /// Returns the local address the proxy is listening on.
-    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.socket.local_addr()
+    /// Returns the IPv4 local address the proxy is listening on.
+    pub fn local_addr_v4(&self) -> Result<SocketAddr, std::io::Error> {
+        self.socket_v4.local_addr()
     }
 
-    /// Runs the proxy, receiving DNS queries from the child and forwarding
-    /// them to the original DNS server.
+    /// Returns the IPv6 local address the proxy is listening on.
+    /// Falls back to an IPv4-mapped IPv6 address when IPv6 is unavailable.
+    pub fn local_addr_v6(&self) -> Result<SocketAddr, std::io::Error> {
+        if let Some(socket_v6) = &self.socket_v6 {
+            return socket_v6.local_addr();
+        }
+        let v4_addr = self.socket_v4.local_addr()?;
+        let v4_addr = match v4_addr {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "unexpected IPv6 address for IPv4 socket",
+                ));
+            }
+        };
+        let v4_mapped = v4_addr.ip().to_ipv6_mapped();
+        let v6_addr = std::net::SocketAddrV6::new(v4_mapped, v4_addr.port(), 0, 0);
+        Ok(SocketAddr::V6(v6_addr))
+    }
+
+    /// Runs the proxy on both IPv4 and IPv6 sockets concurrently.
     pub async fn run(&self) -> Result<(), std::io::Error> {
+        if let Some(socket_v6) = &self.socket_v6 {
+            tokio::try_join!(self.run_socket(&self.socket_v4), self.run_socket(socket_v6))?;
+            return Ok(());
+        }
+
+        self.run_socket(&self.socket_v4).await?;
+        Ok(())
+    }
+
+    async fn run_socket(&self, socket: &Arc<UdpSocket>) -> Result<(), std::io::Error> {
         let mut buf = [0u8; DNS_BUF_SIZE];
 
         loop {
-            let (len, child_addr) = self.socket.recv_from(&mut buf).await?;
+            let (len, child_addr) = socket.recv_from(&mut buf).await?;
             let packet = buf[..len].to_vec();
 
             let (txid, name) = match parse_txid_and_name(&packet) {
@@ -148,7 +198,7 @@ impl DnsProxyServer {
                 }
             };
             let pending = self.state.take_query(txid, name.as_deref());
-            let socket = Arc::clone(&self.socket);
+            let socket = Arc::clone(socket);
             let state = Arc::clone(&self.state);
 
             tokio::spawn(async move {
