@@ -54,9 +54,10 @@ impl DnsProxyState {
         if let Ok(mut pending) = self.pending_queries.lock() {
             purge_expired(&mut pending);
             debug!(
-                "registered DNS query: {} -> {}",
+                "registered DNS query: {} -> {} (txid={})",
                 query.domain.as_deref().unwrap_or("<unknown>"),
-                query.original_server
+                query.original_server,
+                query.txid
             );
             let entry = PendingEntry {
                 query,

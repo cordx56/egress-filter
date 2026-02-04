@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::{mem::offset_of, mem::size_of};
 
 use crate::allowlist::AllowList;
 use crate::proxy::PendingDnsQuery;
@@ -285,13 +286,56 @@ impl<'a> NetworkHandler<'a> {
         let dest_addr_ptr = notification.args[4];
         let addr_len = notification.args[5] as u32;
 
-        // If dest_addr is NULL, it's connected UDP; allow for now
+        // If dest_addr is NULL, it's connected UDP; handle like send().
         if dest_addr_ptr == 0 {
-            debug!("sendto with NULL dest_addr, allowing");
-            self.handler.allow(notification)?;
-            return Ok(Decision::Skipped {
-                reason: "connected UDP socket".into(),
-            });
+            let fd = notification.args[0] as i32;
+            let Some(dest) = self.socket_tracker.get(notification.pid, fd) else {
+                debug!("sendto with NULL dest_addr on untracked socket, allowing");
+                self.handler.allow(notification)?;
+                return Ok(Decision::Skipped {
+                    reason: "connected UDP socket (untracked)".into(),
+                });
+            };
+
+            if dest.port() != 53 || buf_len == 0 {
+                debug!("sendto with NULL dest_addr to non-DNS {}, allowing", dest);
+                self.handler.allow(notification)?;
+                return Ok(Decision::Skipped {
+                    reason: "connected UDP socket (non-DNS)".into(),
+                });
+            }
+
+            // Validate notification
+            if !self.handler.is_valid(notification) {
+                warn!("notification {} became invalid", notification.id);
+                return Ok(Decision::Skipped {
+                    reason: "notification became invalid".into(),
+                });
+            }
+
+            let mut txid = None;
+            let dns_name = match DnsQuery::parse(mem, buf_ptr, buf_len) {
+                Ok(query) => {
+                    txid = Some(query.txid);
+                    debug!("DNS query (sendto/connected) for: {}", query.name);
+                    Some(query.name)
+                }
+                Err(e) => {
+                    debug!("failed to parse DNS query in sendto/connected: {}", e);
+                    None
+                }
+            };
+            if txid.is_none() {
+                txid = DnsQuery::read_txid(mem, buf_ptr, buf_len).ok();
+            }
+
+            let target = ConnectionTarget {
+                ip: dest.ip(),
+                port: dest.port(),
+                dns_name,
+            };
+
+            return self.decide_dns_query(notification, &target, dest, txid);
         }
 
         // Validate notification
@@ -568,97 +612,148 @@ impl<'a> NetworkHandler<'a> {
             });
         }
 
-        // Read the first mmsghdr structure
-        // struct mmsghdr { struct msghdr msg_hdr; unsigned int msg_len; }
-        // struct msghdr { void *msg_name; socklen_t msg_namelen; struct iovec *msg_iov; size_t msg_iovlen; ... }
-        // On 64-bit: msghdr is 56 bytes, mmsghdr is 64 bytes
-        // msg_iov is at offset 16 in msghdr
-        // struct iovec { void *iov_base; size_t iov_len; }
-        let msg_iov_ptr: u64 = match mem.read_value(msgvec_ptr + 16) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                debug!("failed to read msg_iov pointer: {}", e);
-                self.handler.allow(notification)?;
-                return Ok(Decision::Skipped {
-                    reason: format!("failed to read msg_iov: {}", e),
+        let mut first_target: Option<ConnectionTarget> = None;
+        let mut queries: Vec<(Option<String>, Option<u16>)> = Vec::with_capacity(vlen);
+
+        for idx in 0..vlen {
+            let msg_offset = msgvec_ptr + (idx as u64 * size_of::<libc::mmsghdr>() as u64);
+            let msg_hdr_offset = msg_offset + offset_of!(libc::mmsghdr, msg_hdr) as u64;
+
+            let msg_iov_ptr: u64 =
+                match mem.read_value(msg_hdr_offset + offset_of!(libc::msghdr, msg_iov) as u64) {
+                    Ok(ptr) => ptr,
+                    Err(e) => {
+                        debug!("failed to read msg_iov pointer: {}", e);
+                        continue;
+                    }
+                };
+
+            let msg_iovlen: u64 = match mem
+                .read_value(msg_hdr_offset + offset_of!(libc::msghdr, msg_iovlen) as u64)
+            {
+                Ok(len) => len,
+                Err(e) => {
+                    debug!("failed to read msg_iovlen: {}", e);
+                    continue;
+                }
+            };
+
+            if msg_iovlen == 0 || msg_iov_ptr == 0 {
+                debug!("sendmmsg with empty iov entry, skipping");
+                continue;
+            }
+
+            let iov_base: u64 =
+                match mem.read_value(msg_iov_ptr + offset_of!(libc::iovec, iov_base) as u64) {
+                    Ok(ptr) => ptr,
+                    Err(e) => {
+                        debug!("failed to read iov_base: {}", e);
+                        continue;
+                    }
+                };
+
+            let iov_len: u64 =
+                match mem.read_value(msg_iov_ptr + offset_of!(libc::iovec, iov_len) as u64) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        debug!("failed to read iov_len: {}", e);
+                        continue;
+                    }
+                };
+
+            if iov_base == 0 || iov_len == 0 {
+                debug!("sendmmsg with empty buffer entry, skipping");
+                continue;
+            }
+
+            let mut txid = None;
+            let dns_name = match DnsQuery::parse(mem, iov_base, iov_len as usize) {
+                Ok(query) => {
+                    txid = Some(query.txid);
+                    debug!("DNS query (sendmmsg) for: {}", query.name);
+                    Some(query.name)
+                }
+                Err(e) => {
+                    debug!("failed to parse DNS query in sendmmsg: {}", e);
+                    None
+                }
+            };
+            if txid.is_none() {
+                txid = DnsQuery::read_txid(mem, iov_base, iov_len as usize).ok();
+            }
+
+            if first_target.is_none() {
+                first_target = Some(ConnectionTarget {
+                    ip: dest.ip(),
+                    port: dest.port(),
+                    dns_name: dns_name.clone(),
                 });
             }
-        };
 
-        let msg_iovlen: u64 = match mem.read_value(msgvec_ptr + 24) {
-            Ok(len) => len,
-            Err(e) => {
-                debug!("failed to read msg_iovlen: {}", e);
-                self.handler.allow(notification)?;
-                return Ok(Decision::Skipped {
-                    reason: format!("failed to read msg_iovlen: {}", e),
-                });
-            }
-        };
+            queries.push((dns_name, txid));
+        }
 
-        if msg_iovlen == 0 || msg_iov_ptr == 0 {
-            debug!("sendmmsg with empty iov, allowing");
+        let Some(target) = first_target else {
+            debug!("sendmmsg with no parseable DNS queries, allowing");
             self.handler.allow(notification)?;
             return Ok(Decision::Skipped {
-                reason: "empty iov".into(),
+                reason: "empty DNS payloads".into(),
+            });
+        };
+
+        let allowlist = self.allowlist.read().unwrap();
+        let denied_name = queries.iter().find_map(|(name, _)| match name {
+            None => Some("<unknown>".to_string()),
+            Some(name) if !allowlist.is_dns_query_allowed(name) => Some(name.clone()),
+            _ => None,
+        });
+
+        if let Some(name) = denied_name {
+            let denied_target = ConnectionTarget {
+                ip: dest.ip(),
+                port: dest.port(),
+                dns_name: Some(name),
+            };
+            let should_notify = allowlist.should_notify_block(denied_target.ip, denied_target.port);
+            drop(allowlist);
+            info!("denied: {} (DNS query)", denied_target);
+            if should_notify {
+                eprintln!("[egress-filter] DNS query blocked: {}", denied_target);
+            }
+            self.handler.deny(notification)?;
+            return Ok(Decision::Denied {
+                target: denied_target,
             });
         }
+        drop(allowlist);
 
-        // Read the first iovec
-        let iov_base: u64 = match mem.read_value(msg_iov_ptr) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                debug!("failed to read iov_base: {}", e);
-                self.handler.allow(notification)?;
-                return Ok(Decision::Skipped {
-                    reason: format!("failed to read iov_base: {}", e),
+        let decision = self.decide_dns_query(notification, &target, dest, queries[0].1)?;
+
+        if let Decision::Allowed { .. } = decision
+            && let Some(ref dns_redirect) = self.dns_redirect
+        {
+            let allowlist = self.allowlist.read().unwrap();
+            for (idx, (name, txid)) in queries.iter().enumerate() {
+                if idx == 0 {
+                    continue;
+                }
+                let Some(txid) = txid else {
+                    continue;
+                };
+                let ports = name
+                    .as_ref()
+                    .map(|name| allowlist.get_domain_ports(name))
+                    .unwrap_or_default();
+                (dns_redirect.register_query)(PendingDnsQuery {
+                    original_server: dest,
+                    domain: name.clone(),
+                    ports,
+                    txid: *txid,
                 });
             }
-        };
-
-        let iov_len: u64 = match mem.read_value(msg_iov_ptr + 8) {
-            Ok(len) => len,
-            Err(e) => {
-                debug!("failed to read iov_len: {}", e);
-                self.handler.allow(notification)?;
-                return Ok(Decision::Skipped {
-                    reason: format!("failed to read iov_len: {}", e),
-                });
-            }
-        };
-
-        if iov_base == 0 || iov_len == 0 {
-            debug!("sendmmsg with empty buffer, allowing");
-            self.handler.allow(notification)?;
-            return Ok(Decision::Skipped {
-                reason: "empty buffer".into(),
-            });
         }
 
-        // Parse DNS query from the buffer
-        let mut txid = None;
-        let dns_name = match DnsQuery::parse(mem, iov_base, iov_len as usize) {
-            Ok(query) => {
-                txid = Some(query.txid);
-                debug!("DNS query (sendmmsg) for: {}", query.name);
-                Some(query.name)
-            }
-            Err(e) => {
-                debug!("failed to parse DNS query in sendmmsg: {}", e);
-                None
-            }
-        };
-        if txid.is_none() {
-            txid = DnsQuery::read_txid(mem, iov_base, iov_len as usize).ok();
-        }
-
-        let target = ConnectionTarget {
-            ip: dest.ip(),
-            port: dest.port(),
-            dns_name,
-        };
-
-        self.decide_dns_query(notification, &target, dest, txid)
+        Ok(decision)
     }
 
     /// Handles send(fd, buf, len, flags) syscall for connected sockets.
