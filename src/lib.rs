@@ -265,7 +265,7 @@ impl Supervisor {
                 match self.child_main(child_sock, program, &c_args, &env) {
                     Ok(_) => unreachable!(),
                     Err(e) => {
-                        eprintln!("egress-filter: child setup failed: {}", e);
+                        println!("egress-filter: child setup failed: {}", e);
                         std::process::exit(127);
                     }
                 }

@@ -554,7 +554,7 @@ impl<'a> NetworkHandler<'a> {
             info!("denied: {} (DNS query)", target);
             let al = self.allowlist.read().unwrap();
             if al.should_notify_block(target.ip, target.port) {
-                eprintln!("[egress-filter] DNS query blocked: {}", target);
+                println!("[egress-filter] DNS query blocked: {}", target);
             }
             drop(al);
             self.handler.deny(notification)?;
@@ -610,7 +610,7 @@ impl<'a> NetworkHandler<'a> {
             info!("denied: {} (DNS query)", target);
             let al = self.allowlist.read().unwrap();
             if al.should_notify_block(target.ip, target.port) {
-                eprintln!("[egress-filter] DNS query blocked: {}", target);
+                println!("[egress-filter] DNS query blocked: {}", target);
             }
             drop(al);
             self.handler.deny(notification)?;
@@ -644,7 +644,7 @@ impl<'a> NetworkHandler<'a> {
             info!("denied: {}", target);
             // Output a message to stderr (deduplicated)
             if allowlist.should_notify_block(target.ip, target.port) {
-                eprintln!("[egress-filter] Connection blocked: {}", target);
+                println!("[egress-filter] Connection blocked: {}", target);
             }
             self.handler.deny(notification)?;
             Ok(Decision::Denied {
@@ -812,7 +812,7 @@ impl<'a> NetworkHandler<'a> {
             drop(allowlist);
             info!("denied: {} (DNS query)", denied_target);
             if should_notify {
-                eprintln!("[egress-filter] DNS query blocked: {}", denied_target);
+                println!("[egress-filter] DNS query blocked: {}", denied_target);
             }
             self.handler.deny(notification)?;
             return Ok(Decision::Denied {

@@ -1,6 +1,9 @@
 version: 1
 default_policy: deny
 
+dns:
+  mode: system
+
 doh:
   enabled: false
 

@@ -250,7 +250,7 @@ async fn handle_request(
             .await;
         } else {
             info!("DoH denied: {}", doh_request.query.name);
-            eprintln!(
+            println!(
                 "[egress-filter] DoH query blocked: {}",
                 doh_request.query.name
             );
