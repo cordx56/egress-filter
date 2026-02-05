@@ -278,6 +278,8 @@ impl<'a> NetworkHandler<'a> {
                 match dns_redirect.proxy_addr_v6 {
                     Some(addr) => addr,
                     None => {
+                        // connect() path: allowlist not yet checked, fall
+                        // through to decide_and_respond for policy evaluation.
                         warn!(
                             "DNS proxy IPv6 socket unavailable; skipping redirect for {}",
                             target
@@ -510,6 +512,8 @@ impl<'a> NetworkHandler<'a> {
                         match dns_redirect.proxy_addr_v6 {
                             Some(addr) => addr,
                             None => {
+                                // sendto() path: allowlist already checked
+                                // above, so allow without re-evaluation.
                                 warn!(
                                     "DNS proxy IPv6 socket unavailable; skipping redirect for {}",
                                     target

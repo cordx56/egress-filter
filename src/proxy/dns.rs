@@ -300,22 +300,32 @@ impl DnsProxyServer {
 
             let original_server = query.original_server;
             let domain_for_log = query.domain.as_deref().unwrap_or("<unknown>");
+            let mut system_fallback = false;
             if self.dns_mode == DnsProxyMode::System {
-                let response = self.resolve_system(&packet, &query).await;
-                if let Some(resp) = response {
-                    if let Err(e) = socket.send_to(&resp, child_addr).await {
-                        error!("DNS proxy send_to child error: {}", e);
+                match self.resolve_system(&packet, &query).await {
+                    SystemResolveOutcome::Response(resp) => {
+                        if let Err(e) = socket.send_to(&resp, child_addr).await {
+                            error!("DNS proxy send_to child error: {}", e);
+                        }
+                        continue;
                     }
-                } else {
-                    warn!("system DNS resolution failed for {}", domain_for_log);
+                    SystemResolveOutcome::Fallback => {
+                        system_fallback = true;
+                    }
                 }
-                continue;
             }
 
-            debug!(
-                "forwarding DNS query for {} to {}",
-                domain_for_log, original_server
-            );
+            if system_fallback {
+                debug!(
+                    "system mode fallback: forwarding DNS query for {} to {}",
+                    domain_for_log, original_server
+                );
+            } else {
+                debug!(
+                    "forwarding DNS query for {} to {}",
+                    domain_for_log, original_server
+                );
+            }
 
             let listen_is_v6 = child_addr.is_ipv6();
             let entry = InflightEntry {
@@ -336,24 +346,19 @@ impl DnsProxyServer {
 
             rewrite_txid(&mut packet, internal_txid);
 
-            let (upstream_addr, upstream_socket) = match self.dns_mode {
-                DnsProxyMode::Preserve => {
-                    if original_server.is_ipv6() {
-                        if let Some(socket) = &self.upstream_v6 {
-                            (original_server, socket)
-                        } else {
-                            warn!(
-                                "IPv6 upstream DNS socket unavailable; dropping query to {}",
-                                original_server
-                            );
-                            self.state.take_inflight(internal_txid);
-                            continue;
-                        }
-                    } else {
-                        (original_server, &self.upstream_v4)
-                    }
+            let (upstream_addr, upstream_socket) = if original_server.is_ipv6() {
+                if let Some(socket) = &self.upstream_v6 {
+                    (original_server, socket)
+                } else {
+                    warn!(
+                        "IPv6 upstream DNS socket unavailable; dropping query to {}",
+                        original_server
+                    );
+                    self.state.take_inflight(internal_txid);
+                    continue;
                 }
-                DnsProxyMode::System => unreachable!("system mode handled before forwarding"),
+            } else {
+                (original_server, &self.upstream_v4)
             };
 
             if let Err(e) = upstream_socket.send_to(&packet, upstream_addr).await {
@@ -430,14 +435,16 @@ impl DnsProxyServer {
         }
     }
 
-    async fn resolve_system(&self, packet: &[u8], query: &PendingDnsQuery) -> Option<Vec<u8>> {
-        let parsed = DnsNameParser::parse_query_lenient(packet).ok()?;
+    async fn resolve_system(&self, packet: &[u8], query: &PendingDnsQuery) -> SystemResolveOutcome {
+        let Ok(parsed) = DnsNameParser::parse_query_lenient(packet) else {
+            return SystemResolveOutcome::Response(build_error_response(packet, RCODE_SERVFAIL));
+        };
         let name = parsed.name;
         let qtype = parsed.qtype;
         let ports = query.ports.clone();
 
         let mut addresses = Vec::new();
-        if qtype == QTYPE_A || qtype == QTYPE_AAAA || qtype == QTYPE_ANY {
+        if matches!(qtype, QTYPE_A | QTYPE_AAAA | QTYPE_ANY) {
             if let Ok(addrs) = lookup_host((name.as_str(), 0)).await {
                 for addr in addrs {
                     match addr.ip() {
@@ -451,19 +458,20 @@ impl DnsProxyServer {
                     }
                 }
             }
+        } else {
+            return SystemResolveOutcome::Fallback;
         }
 
         if addresses.is_empty() {
-            return Some(build_error_response(packet, RCODE_SERVFAIL));
+            return SystemResolveOutcome::Response(build_error_response(packet, RCODE_SERVFAIL));
         }
 
-        if let Some(ref domain) = query.domain {
-            self.state
-                .resolution_cache
-                .cache_resolution(domain, &addresses, ports);
-        }
+        let domain = query.domain.as_deref().unwrap_or(&name);
+        self.state
+            .resolution_cache
+            .cache_resolution(domain, &addresses, ports);
 
-        Some(build_response(packet, &addresses))
+        SystemResolveOutcome::Response(build_response(packet, &addresses))
     }
 }
 
@@ -493,13 +501,59 @@ fn purge_inflight(inflight: &mut HashMap<u16, InflightEntry>) {
 const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
 const QTYPE_ANY: u16 = 255;
+
+enum SystemResolveOutcome {
+    Response(Vec<u8>),
+    Fallback,
+}
 const DNS_CLASS_IN: u16 = 1;
-const RCODE_NOERROR: u16 = 0;
 const RCODE_SERVFAIL: u16 = 2;
 const DEFAULT_TTL: u32 = 60;
 
+/// Finds the byte offset immediately after the question section.
+/// Returns `None` if the packet is malformed.
+fn find_question_end(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        // Skip domain name labels
+        loop {
+            if offset >= packet.len() {
+                return None;
+            }
+            let label_len = packet[offset] as usize;
+            if label_len == 0 {
+                offset += 1;
+                break;
+            }
+            if label_len >= 0xC0 {
+                // Compression pointer (2 bytes)
+                offset += 2;
+                break;
+            }
+            offset += 1 + label_len;
+        }
+        // QTYPE (2) + QCLASS (2)
+        offset += 4;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+    Some(offset)
+}
+
+/// Truncates the packet to header + question section, discarding any
+/// authority/additional sections (e.g. EDNS0 OPT records).
+fn truncate_to_question(query: &[u8]) -> Vec<u8> {
+    let end = find_question_end(query).unwrap_or(query.len());
+    query[..end].to_vec()
+}
+
 fn build_response(query: &[u8], addresses: &[IpAddr]) -> Vec<u8> {
-    let mut response = query.to_vec();
+    let mut response = truncate_to_question(query);
 
     if response.len() < 12 {
         return response;
@@ -510,7 +564,7 @@ fn build_response(query: &[u8], addresses: &[IpAddr]) -> Vec<u8> {
     response[2] = (new_flags >> 8) as u8;
     response[3] = (new_flags & 0xFF) as u8;
 
-    let ancount = addresses.len() as u16;
+    let ancount = u16::try_from(addresses.len()).unwrap_or(u16::MAX);
     response[6] = (ancount >> 8) as u8;
     response[7] = (ancount & 0xFF) as u8;
     response[8] = 0;
@@ -542,7 +596,7 @@ fn build_response(query: &[u8], addresses: &[IpAddr]) -> Vec<u8> {
 }
 
 fn build_error_response(query: &[u8], rcode: u16) -> Vec<u8> {
-    let mut response = query.to_vec();
+    let mut response = truncate_to_question(query);
     if response.len() < 12 {
         return response;
     }
