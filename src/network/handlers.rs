@@ -227,30 +227,64 @@ impl<'a> NetworkHandler<'a> {
                 "tracking DNS socket: pid={} fd={} -> {}",
                 notification.pid, fd, parsed.addr
             );
+        }
 
-            // Redirect to the local DNS proxy if configured
-            if let Some(ref dns_redirect) = self.dns_redirect {
-                let proxy_addr = if target.ip.is_ipv6() {
-                    dns_redirect.proxy_addr_v6
+        // Also track connections to our DNS proxy port.
+        // This handles cases where the child (e.g., Node.js/libuv) caches the
+        // redirected proxy address and reconnects directly to it.
+        if let Some(ref dns_redirect) = self.dns_redirect {
+            let is_proxy_port = parsed.addr == dns_redirect.proxy_addr_v4
+                || parsed.addr == dns_redirect.proxy_addr_v6;
+            if is_proxy_port {
+                let fd = notification.args[0] as i32;
+                // Track as DNS proxy connection; use a well-known DNS server
+                // as the "original" so send() handler processes it correctly.
+                let synthetic_dns = if parsed.addr.is_ipv6() {
+                    std::net::SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                        53,
+                    )
                 } else {
-                    dns_redirect.proxy_addr_v4
+                    std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 53)),
+                        53,
+                    )
                 };
-                if let Err(e) = SocketAddress::write(mem, addr_ptr, addr_len, proxy_addr) {
-                    warn!("failed to rewrite DNS sockaddr: {}", e);
-                } else {
-                    info!(
-                        "redirected DNS {}:{} to proxy {}",
-                        target.ip, target.port, proxy_addr
-                    );
-                    self.handler.allow(notification)?;
-                    return Ok(Decision::Allowed {
-                        target: ConnectionTarget {
-                            ip: target.ip,
-                            port: target.port,
-                            dns_name: Some("redirected to DNS proxy".to_string()),
-                        },
-                    });
-                }
+                self.socket_tracker
+                    .track(notification.pid, fd, synthetic_dns);
+                debug!(
+                    "tracking DNS proxy socket: pid={} fd={} -> {} (synthetic: {})",
+                    notification.pid, fd, parsed.addr, synthetic_dns
+                );
+                self.handler.allow(notification)?;
+                return Ok(Decision::Allowed { target });
+            }
+        }
+
+        // Redirect DNS connections to the local proxy if configured
+        if parsed.port() == 53
+            && let Some(ref dns_redirect) = self.dns_redirect
+        {
+            let proxy_addr = if target.ip.is_ipv6() {
+                dns_redirect.proxy_addr_v6
+            } else {
+                dns_redirect.proxy_addr_v4
+            };
+            if let Err(e) = SocketAddress::write(mem, addr_ptr, addr_len, proxy_addr) {
+                warn!("failed to rewrite DNS sockaddr: {}", e);
+            } else {
+                info!(
+                    "redirected DNS {}:{} to proxy {}",
+                    target.ip, target.port, proxy_addr
+                );
+                self.handler.allow(notification)?;
+                return Ok(Decision::Allowed {
+                    target: ConnectionTarget {
+                        ip: target.ip,
+                        port: target.port,
+                        dns_name: Some("redirected to DNS proxy".to_string()),
+                    },
+                });
             }
         }
 
