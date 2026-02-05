@@ -5,16 +5,26 @@
 //! the resolved IPs before returning the response to the child.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, lookup_host};
 use tracing::{debug, error, warn};
 
 use super::DohResponse;
 use super::server::ResolutionCache;
+use crate::network::DnsNameParser;
+
+/// DNS proxy behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsProxyMode {
+    /// Preserve the original DNS server and forward queries to it.
+    Preserve,
+    /// Ignore the original DNS server and use the system resolver's servers.
+    System,
+}
 
 /// DNS query pending proxy forwarding.
 /// Registered by the seccomp handler before the query reaches the proxy.
@@ -139,6 +149,7 @@ pub struct DnsProxyServer {
     upstream_v4: Arc<UdpSocket>,
     upstream_v6: Option<Arc<UdpSocket>>,
     state: Arc<DnsProxyState>,
+    dns_mode: DnsProxyMode,
 }
 
 /// Buffer size for DNS packets (EDNS0 supports up to 4096).
@@ -162,7 +173,11 @@ impl DnsProxyServer {
     /// Binds the proxy on `127.0.0.1` and, when available, `[::1]` with the
     /// given port (0 for ephemeral). When `port` is 0, the IPv6 socket reuses
     /// the port assigned to the IPv4 socket so both share the same port number.
-    pub async fn bind(state: Arc<DnsProxyState>, port: u16) -> Result<Self, std::io::Error> {
+    pub async fn bind(
+        state: Arc<DnsProxyState>,
+        port: u16,
+        dns_mode: DnsProxyMode,
+    ) -> Result<Self, std::io::Error> {
         let socket_v4 = UdpSocket::bind(("127.0.0.1", port)).await?;
         let v6_port = if port == 0 {
             socket_v4.local_addr()?.port()
@@ -196,6 +211,7 @@ impl DnsProxyServer {
             upstream_v4: Arc::new(upstream_v4),
             upstream_v6,
             state,
+            dns_mode,
         })
     }
 
@@ -205,28 +221,26 @@ impl DnsProxyServer {
     }
 
     /// Returns the IPv6 local address the proxy is listening on.
-    /// Falls back to an IPv4-mapped IPv6 address when IPv6 is unavailable.
-    pub fn local_addr_v6(&self) -> Result<SocketAddr, std::io::Error> {
-        if let Some(socket_v6) = &self.socket_v6 {
-            return socket_v6.local_addr();
-        }
-        let v4_addr = self.socket_v4.local_addr()?;
-        let v4_addr = match v4_addr {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    "unexpected IPv6 address for IPv4 socket",
-                ));
-            }
-        };
-        let v4_mapped = v4_addr.ip().to_ipv6_mapped();
-        let v6_addr = std::net::SocketAddrV6::new(v4_mapped, v4_addr.port(), 0, 0);
-        Ok(SocketAddr::V6(v6_addr))
+    pub fn local_addr_v6(&self) -> Option<SocketAddr> {
+        self.socket_v6
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
     }
 
     /// Runs the proxy on both IPv4 and IPv6 sockets concurrently.
     pub async fn run(&self) -> Result<(), std::io::Error> {
+        if self.dns_mode == DnsProxyMode::System {
+            match &self.socket_v6 {
+                Some(socket_v6) => {
+                    tokio::try_join!(self.run_socket(&self.socket_v4), self.run_socket(socket_v6))?;
+                }
+                None => {
+                    self.run_socket(&self.socket_v4).await?;
+                }
+            }
+            return Ok(());
+        }
+
         match (&self.socket_v6, &self.upstream_v6) {
             (Some(socket_v6), Some(upstream_v6)) => {
                 tokio::try_join!(
@@ -286,6 +300,18 @@ impl DnsProxyServer {
 
             let original_server = query.original_server;
             let domain_for_log = query.domain.as_deref().unwrap_or("<unknown>");
+            if self.dns_mode == DnsProxyMode::System {
+                let response = self.resolve_system(&packet, &query).await;
+                if let Some(resp) = response {
+                    if let Err(e) = socket.send_to(&resp, child_addr).await {
+                        error!("DNS proxy send_to child error: {}", e);
+                    }
+                } else {
+                    warn!("system DNS resolution failed for {}", domain_for_log);
+                }
+                continue;
+            }
+
             debug!(
                 "forwarding DNS query for {} to {}",
                 domain_for_log, original_server
@@ -310,23 +336,28 @@ impl DnsProxyServer {
 
             rewrite_txid(&mut packet, internal_txid);
 
-            let upstream = if original_server.is_ipv6() {
-                if let Some(socket) = &self.upstream_v6 {
-                    socket
-                } else {
-                    warn!(
-                        "IPv6 upstream DNS socket unavailable; dropping query to {}",
-                        original_server
-                    );
-                    self.state.take_inflight(internal_txid);
-                    continue;
+            let (upstream_addr, upstream_socket) = match self.dns_mode {
+                DnsProxyMode::Preserve => {
+                    if original_server.is_ipv6() {
+                        if let Some(socket) = &self.upstream_v6 {
+                            (original_server, socket)
+                        } else {
+                            warn!(
+                                "IPv6 upstream DNS socket unavailable; dropping query to {}",
+                                original_server
+                            );
+                            self.state.take_inflight(internal_txid);
+                            continue;
+                        }
+                    } else {
+                        (original_server, &self.upstream_v4)
+                    }
                 }
-            } else {
-                &self.upstream_v4
+                DnsProxyMode::System => unreachable!("system mode handled before forwarding"),
             };
 
-            if let Err(e) = upstream.send_to(&packet, original_server).await {
-                error!("upstream DNS send error for {}: {}", original_server, e);
+            if let Err(e) = upstream_socket.send_to(&packet, upstream_addr).await {
+                error!("upstream DNS send error for {}: {}", upstream_addr, e);
                 self.state.take_inflight(internal_txid);
                 continue;
             }
@@ -398,6 +429,42 @@ impl DnsProxyServer {
             }
         }
     }
+
+    async fn resolve_system(&self, packet: &[u8], query: &PendingDnsQuery) -> Option<Vec<u8>> {
+        let parsed = DnsNameParser::parse_query_lenient(packet).ok()?;
+        let name = parsed.name;
+        let qtype = parsed.qtype;
+        let ports = query.ports.clone();
+
+        let mut addresses = Vec::new();
+        if qtype == QTYPE_A || qtype == QTYPE_AAAA || qtype == QTYPE_ANY {
+            if let Ok(addrs) = lookup_host((name.as_str(), 0)).await {
+                for addr in addrs {
+                    match addr.ip() {
+                        IpAddr::V4(ip) if qtype == QTYPE_A || qtype == QTYPE_ANY => {
+                            addresses.push(IpAddr::V4(ip));
+                        }
+                        IpAddr::V6(ip) if qtype == QTYPE_AAAA || qtype == QTYPE_ANY => {
+                            addresses.push(IpAddr::V6(ip));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if addresses.is_empty() {
+            return Some(build_error_response(packet, RCODE_SERVFAIL));
+        }
+
+        if let Some(ref domain) = query.domain {
+            self.state
+                .resolution_cache
+                .cache_resolution(domain, &addresses, ports);
+        }
+
+        Some(build_response(packet, &addresses))
+    }
 }
 
 fn purge_expired(pending: &mut HashMap<u16, VecDeque<PendingEntry>>) {
@@ -421,6 +488,75 @@ fn purge_inflight(inflight: &mut HashMap<u16, InflightEntry>) {
         }
         alive
     });
+}
+
+const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
+const QTYPE_ANY: u16 = 255;
+const DNS_CLASS_IN: u16 = 1;
+const RCODE_NOERROR: u16 = 0;
+const RCODE_SERVFAIL: u16 = 2;
+const DEFAULT_TTL: u32 = 60;
+
+fn build_response(query: &[u8], addresses: &[IpAddr]) -> Vec<u8> {
+    let mut response = query.to_vec();
+
+    if response.len() < 12 {
+        return response;
+    }
+
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    let new_flags = (flags | 0x8000 | 0x0080) & !0x000F;
+    response[2] = (new_flags >> 8) as u8;
+    response[3] = (new_flags & 0xFF) as u8;
+
+    let ancount = addresses.len() as u16;
+    response[6] = (ancount >> 8) as u8;
+    response[7] = (ancount & 0xFF) as u8;
+    response[8] = 0;
+    response[9] = 0;
+    response[10] = 0;
+    response[11] = 0;
+
+    for addr in addresses {
+        response.extend_from_slice(&[0xC0, 0x0C]);
+        match addr {
+            IpAddr::V4(ip) => {
+                response.extend_from_slice(&QTYPE_A.to_be_bytes());
+                response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+                response.extend_from_slice(&DEFAULT_TTL.to_be_bytes());
+                response.extend_from_slice(&(4u16).to_be_bytes());
+                response.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                response.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
+                response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+                response.extend_from_slice(&DEFAULT_TTL.to_be_bytes());
+                response.extend_from_slice(&(16u16).to_be_bytes());
+                response.extend_from_slice(&ip.octets());
+            }
+        }
+    }
+
+    response
+}
+
+fn build_error_response(query: &[u8], rcode: u16) -> Vec<u8> {
+    let mut response = query.to_vec();
+    if response.len() < 12 {
+        return response;
+    }
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    let new_flags = (flags | 0x8000 | 0x0080) & !0x000F | (rcode & 0x000F);
+    response[2] = (new_flags >> 8) as u8;
+    response[3] = (new_flags & 0xFF) as u8;
+    response[6] = 0;
+    response[7] = 0;
+    response[8] = 0;
+    response[9] = 0;
+    response[10] = 0;
+    response[11] = 0;
+    response
 }
 
 fn extract_txid(packet: &[u8]) -> Option<u16> {

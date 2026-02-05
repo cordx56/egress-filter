@@ -86,13 +86,14 @@ Field notes:
 - `domains[].ports`: `null` (or omitted) means all ports
 - `ip_ranges[].cidr`: CIDR or single IP
 - `ip_ranges[].ports`: `null` (or omitted) means all ports
+- `dns.mode`: `preserve` (forward to original DNS server) or `system` (resolve via system resolver and answer directly)
 - `doh.enabled`: enables HTTPS proxy + DoH request inspection
 
 ## DNS Proxy
 
 The supervisor always starts a local UDP DNS proxy. When the child process sends a DNS query (port 53), the seccomp handler intercepts the syscall, rewrites the destination to the local proxy, and allows it through. The proxy then:
 
-1. Forwards the query to the original upstream DNS server
+1. Forwards the query to the original upstream DNS server (`dns.mode: preserve`), or resolves locally via the system resolver and answers directly (`dns.mode: system`)
 2. Parses A/AAAA records from the response and caches the resolved IPs
 3. Returns the unmodified response to the child process
 

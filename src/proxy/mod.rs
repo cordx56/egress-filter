@@ -9,7 +9,7 @@ mod server;
 mod tls;
 mod tunnel;
 
-pub use dns::{DnsProxyServer, DnsProxyState, PendingDnsQuery};
+pub use dns::{DnsProxyMode, DnsProxyServer, DnsProxyState, PendingDnsQuery};
 pub use doh::{DohDetector, DohRequest, DohResponse};
 pub use server::{AllowListChecker, ProxyServer, ProxyState, ResolutionCache};
 pub use tls::TlsAcceptor;

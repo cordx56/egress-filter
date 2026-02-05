@@ -8,7 +8,7 @@ use crate::proxy::PendingDnsQuery;
 use crate::seccomp::{InterceptedSyscall, NotificationHandler, ProcessMemory, SyscallNotification};
 
 use super::dns::DnsQuery;
-use super::sockaddr::{ParsedAddress, SocketAddress};
+use super::sockaddr::{ParsedAddress, SockaddrError, SocketAddress};
 
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -68,7 +68,7 @@ pub struct DnsRedirect {
     /// The local DNS proxy address to redirect to (IPv4).
     pub proxy_addr_v4: SocketAddr,
     /// The local DNS proxy address to redirect to (IPv6).
-    pub proxy_addr_v6: SocketAddr,
+    pub proxy_addr_v6: Option<SocketAddr>,
     /// Callback to register a pending DNS query with the proxy.
     pub register_query: Arc<dyn Fn(PendingDnsQuery) + Send + Sync>,
 }
@@ -188,6 +188,13 @@ impl<'a> NetworkHandler<'a> {
 
         let parsed = match SocketAddress::read(mem, addr_ptr, addr_len) {
             Ok(addr) => addr,
+            Err(SockaddrError::UnsupportedFamily(family)) => {
+                debug!("skipping non-INET sockaddr family {}, allowing", family);
+                self.handler.allow(notification)?;
+                return Ok(Decision::Skipped {
+                    reason: format!("non-INET address family: {}", family),
+                });
+            }
             Err(e) => {
                 debug!("failed to parse sockaddr, allowing: {}", e);
                 self.handler.allow(notification)?;
@@ -234,7 +241,9 @@ impl<'a> NetworkHandler<'a> {
         // redirected proxy address and reconnects directly to it.
         if let Some(ref dns_redirect) = self.dns_redirect {
             let is_proxy_port = parsed.addr == dns_redirect.proxy_addr_v4
-                || parsed.addr == dns_redirect.proxy_addr_v6;
+                || dns_redirect
+                    .proxy_addr_v6
+                    .is_some_and(|addr| parsed.addr == addr);
             if is_proxy_port {
                 let fd = notification.args[0] as i32;
                 // Track as DNS proxy connection; use a well-known DNS server
@@ -266,7 +275,16 @@ impl<'a> NetworkHandler<'a> {
             && let Some(ref dns_redirect) = self.dns_redirect
         {
             let proxy_addr = if target.ip.is_ipv6() {
-                dns_redirect.proxy_addr_v6
+                match dns_redirect.proxy_addr_v6 {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "DNS proxy IPv6 socket unavailable; skipping redirect for {}",
+                            target
+                        );
+                        return self.decide_and_respond(notification, &target, &parsed);
+                    }
+                }
             } else {
                 dns_redirect.proxy_addr_v4
             };
@@ -489,7 +507,20 @@ impl<'a> NetworkHandler<'a> {
                     });
 
                     let proxy_addr = if target.ip.is_ipv6() {
-                        dns_redirect.proxy_addr_v6
+                        match dns_redirect.proxy_addr_v6 {
+                            Some(addr) => addr,
+                            None => {
+                                warn!(
+                                    "DNS proxy IPv6 socket unavailable; skipping redirect for {}",
+                                    target
+                                );
+                                info!("allowed: {} (DNS sendto, no redirect)", target);
+                                self.handler.allow(notification)?;
+                                return Ok(Decision::Allowed {
+                                    target: target.clone(),
+                                });
+                            }
+                        }
                     } else {
                         dns_redirect.proxy_addr_v4
                     };

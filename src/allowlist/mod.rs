@@ -1,5 +1,5 @@
 mod config;
 mod matcher;
 
-pub use config::{AllowListConfig, AllowListError, DohConfig};
+pub use config::{AllowListConfig, AllowListError, DnsConfig, DnsMode, DohConfig};
 pub use matcher::AllowList;

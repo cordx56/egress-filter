@@ -40,7 +40,7 @@ mod network;
 pub mod proxy;
 mod seccomp;
 
-pub use allowlist::{AllowList, AllowListConfig, AllowListError, DohConfig};
+pub use allowlist::{AllowList, AllowListConfig, AllowListError, DnsConfig, DnsMode, DohConfig};
 pub use network::{
     ConnectionTarget, Decision, DnsQuery, DnsRedirect, NetworkHandler, ProxyRedirect,
 };
@@ -73,8 +73,8 @@ use config_watcher::ConfigEvent;
 
 use ca::CaState;
 use proxy::{
-    AllowListChecker, DnsProxyServer, DnsProxyState, PendingDnsQuery, ProxyServer, ProxyState,
-    ResolutionCache,
+    AllowListChecker, DnsProxyMode, DnsProxyServer, DnsProxyState, PendingDnsQuery, ProxyServer,
+    ProxyState, ResolutionCache,
 };
 
 /// Supervisor that runs a command under egress filtering.
@@ -417,18 +417,30 @@ impl Supervisor {
             .build()
             .context("failed to create DNS proxy tokio runtime")?;
 
+        let dns_mode = match self.config.dns.mode {
+            DnsMode::Preserve => DnsProxyMode::Preserve,
+            DnsMode::System => DnsProxyMode::System,
+        };
         let dns_server = dns_rt
             .block_on(async {
-                DnsProxyServer::bind(Arc::clone(&dns_proxy_state), self.dns_proxy_port).await
+                DnsProxyServer::bind(Arc::clone(&dns_proxy_state), self.dns_proxy_port, dns_mode)
+                    .await
             })
             .context("failed to start DNS proxy server")?;
 
         let dns_proxy_addr_v4 = dns_server.local_addr_v4()?;
-        let dns_proxy_addr_v6 = dns_server.local_addr_v6()?;
-        info!(
-            "DNS proxy listening on {} and {}",
-            dns_proxy_addr_v4, dns_proxy_addr_v6
-        );
+        let dns_proxy_addr_v6 = dns_server.local_addr_v6();
+        if let Some(addr_v6) = dns_proxy_addr_v6 {
+            info!(
+                "DNS proxy listening on {} and {}",
+                dns_proxy_addr_v4, addr_v6
+            );
+        } else {
+            warn!(
+                "DNS proxy IPv6 socket unavailable; listening on {} only",
+                dns_proxy_addr_v4
+            );
+        }
 
         std::thread::spawn(move || {
             dns_rt.block_on(async {
