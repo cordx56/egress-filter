@@ -62,7 +62,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use std::ffi::CString;
 use std::io::{IoSlice, IoSliceMut};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -73,8 +73,8 @@ use config_watcher::ConfigEvent;
 
 use ca::CaState;
 use proxy::{
-    AllowListChecker, DnsProxyMode, DnsProxyServer, DnsProxyState, PendingDnsQuery, ProxyServer,
-    ProxyState, ResolutionCache,
+    AllowListChecker, DnsProxyMode, DnsProxyServer, DnsProxyState, DnsQueryChecker,
+    PendingDnsQuery, ProxyServer, ProxyState, ResolutionCache,
 };
 
 /// Supervisor that runs a command under egress filtering.
@@ -93,6 +93,19 @@ struct AllowListWrapper(Arc<RwLock<AllowList>>);
 impl AllowListChecker for AllowListWrapper {
     fn is_domain_allowed(&self, domain: &str, port: u16) -> bool {
         self.0.read().unwrap().is_domain_allowed(domain, port)
+    }
+}
+
+/// Wrapper to implement DnsQueryChecker for AllowList
+struct DnsQueryCheckerWrapper(Arc<RwLock<AllowList>>);
+
+impl DnsQueryChecker for DnsQueryCheckerWrapper {
+    fn is_dns_query_allowed(&self, name: &str) -> bool {
+        self.0.read().unwrap().is_dns_query_allowed(name)
+    }
+
+    fn get_domain_ports(&self, name: &str) -> Vec<u16> {
+        self.0.read().unwrap().get_domain_ports(name)
     }
 }
 
@@ -410,7 +423,8 @@ impl Supervisor {
 
         // Start DNS proxy (always active, independent of DoH)
         let resolution_cache = Arc::new(ResolutionCacheWrapper(Arc::clone(&self.allowlist)));
-        let dns_proxy_state = Arc::new(DnsProxyState::new(resolution_cache));
+        let query_checker = Arc::new(DnsQueryCheckerWrapper(Arc::clone(&self.allowlist)));
+        let dns_proxy_state = Arc::new(DnsProxyState::new(resolution_cache, query_checker));
 
         let dns_rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -450,12 +464,16 @@ impl Supervisor {
             });
         });
 
-        let dns_state_for_redirect = dns_proxy_state;
+        let dns_state_for_query = Arc::clone(&dns_proxy_state);
+        let dns_state_for_server = dns_proxy_state;
         let dns_redirect = DnsRedirect {
             proxy_addr_v4: dns_proxy_addr_v4,
             proxy_addr_v6: dns_proxy_addr_v6,
             register_query: Arc::new(move |query: PendingDnsQuery| {
-                dns_state_for_redirect.register_query(query);
+                dns_state_for_query.register_query(query);
+            }),
+            register_server: Arc::new(move |server: SocketAddr| {
+                dns_state_for_server.register_server(server);
             }),
         };
 

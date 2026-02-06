@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::{UdpSocket, lookup_host};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::DohResponse;
 use super::server::ResolutionCache;
@@ -24,6 +24,13 @@ pub enum DnsProxyMode {
     Preserve,
     /// Ignore the original DNS server and use the system resolver's servers.
     System,
+}
+
+/// Allowlist checker used by the DNS proxy to handle unregistered queries
+/// (e.g. from the `connect()` + `write()` pattern used by Go's resolver).
+pub trait DnsQueryChecker: Send + Sync {
+    fn is_dns_query_allowed(&self, name: &str) -> bool;
+    fn get_domain_ports(&self, name: &str) -> Vec<u16>;
 }
 
 /// DNS query pending proxy forwarding.
@@ -44,6 +51,23 @@ struct PendingEntry {
     inserted_at: Instant,
 }
 
+/// An original DNS server address registered at `connect()` time.
+/// Used to reconstruct queries arriving via the `connect()` + `write()` pattern.
+struct FallbackServerEntry {
+    server: SocketAddr,
+    inserted_at: Instant,
+}
+
+/// Result of resolving an unregistered DNS query.
+enum UnregisteredResult {
+    /// Query is allowed; use this synthetic PendingDnsQuery.
+    Allowed(PendingDnsQuery),
+    /// Query is denied; send this REFUSED response to the child.
+    Denied(Vec<u8>),
+    /// Could not resolve (no fallback server or unparseable packet).
+    Unknown,
+}
+
 /// Shared state for the DNS proxy, used by both the proxy server
 /// and the seccomp handler (via `register_query`).
 pub struct DnsProxyState {
@@ -51,16 +75,89 @@ pub struct DnsProxyState {
     inflight_queries: Mutex<HashMap<u16, InflightEntry>>,
     next_internal_txid: AtomicUsize,
     resolution_cache: Arc<dyn ResolutionCache>,
+    /// Original DNS servers registered at connect() time for the
+    /// connect()+write() pattern (Go's pure DNS resolver).
+    fallback_servers: Mutex<VecDeque<FallbackServerEntry>>,
+    /// Allowlist checker for unregistered queries.
+    query_checker: Arc<dyn DnsQueryChecker>,
 }
 
+/// Maximum number of fallback server entries to keep.
+const FALLBACK_SERVER_MAX: usize = 64;
+
 impl DnsProxyState {
-    pub fn new(resolution_cache: Arc<dyn ResolutionCache>) -> Self {
+    pub fn new(
+        resolution_cache: Arc<dyn ResolutionCache>,
+        query_checker: Arc<dyn DnsQueryChecker>,
+    ) -> Self {
         Self {
             pending_queries: Mutex::new(HashMap::new()),
             inflight_queries: Mutex::new(HashMap::new()),
             next_internal_txid: AtomicUsize::new(0),
             resolution_cache,
+            fallback_servers: Mutex::new(VecDeque::new()),
+            query_checker,
         }
+    }
+
+    /// Registers an original DNS server address from a `connect()` call.
+    /// Called from the seccomp handler when a DNS connection (port 53) is redirected.
+    pub fn register_server(&self, server: SocketAddr) {
+        if let Ok(mut servers) = self.fallback_servers.lock() {
+            purge_fallback_servers(&mut servers);
+            if servers.len() >= FALLBACK_SERVER_MAX {
+                servers.pop_front();
+            }
+            debug!("registered fallback DNS server: {}", server);
+            servers.push_back(FallbackServerEntry {
+                server,
+                inserted_at: Instant::now(),
+            });
+        }
+    }
+
+    /// Attempts to resolve an unregistered DNS query by parsing the packet,
+    /// checking the allowlist, and popping a fallback server.
+    fn resolve_unregistered(&self, packet: &[u8], txid: u16) -> UnregisteredResult {
+        let query = match DnsNameParser::parse_query_lenient(packet) {
+            Ok(q) => q,
+            Err(e) => {
+                debug!("failed to parse unregistered DNS packet: {}", e);
+                return UnregisteredResult::Unknown;
+            }
+        };
+
+        let name = &query.name;
+
+        if !self.query_checker.is_dns_query_allowed(name) {
+            info!("denied unregistered DNS query for {} (txid={})", name, txid);
+            return UnregisteredResult::Denied(build_error_response(packet, RCODE_REFUSED));
+        }
+
+        let server = self.fallback_servers.lock().ok().and_then(|mut servers| {
+            purge_fallback_servers(&mut servers);
+            servers.pop_front().map(|e| e.server)
+        });
+
+        let Some(server) = server else {
+            warn!(
+                "unregistered DNS query for {} but no fallback server available",
+                name
+            );
+            return UnregisteredResult::Unknown;
+        };
+
+        let ports = self.query_checker.get_domain_ports(name);
+        info!(
+            "allowed unregistered DNS query for {} -> {} (txid={})",
+            name, server, txid
+        );
+        UnregisteredResult::Allowed(PendingDnsQuery {
+            original_server: server,
+            domain: Some(name.clone()),
+            ports,
+            txid,
+        })
     }
 
     /// Registers a pending DNS query. Called synchronously from the
@@ -289,13 +386,28 @@ impl DnsProxyServer {
                 }
             };
 
-            let pending = self.state.take_query(txid, None);
-            let Some(query) = pending else {
-                warn!(
-                    "DNS proxy received packet with no pending query (txid={}), dropping",
-                    txid
-                );
-                continue;
+            let query = match self.state.take_query(txid, None) {
+                Some(q) => q,
+                None => {
+                    // No pre-registered query — try the fallback path for
+                    // connect()+write() senders (e.g. Go's pure DNS resolver).
+                    match self.state.resolve_unregistered(&packet, txid) {
+                        UnregisteredResult::Allowed(q) => q,
+                        UnregisteredResult::Denied(response) => {
+                            if let Err(e) = socket.send_to(&response, child_addr).await {
+                                error!("DNS proxy send_to child error: {}", e);
+                            }
+                            continue;
+                        }
+                        UnregisteredResult::Unknown => {
+                            warn!(
+                                "DNS proxy received packet with no pending query (txid={}), dropping",
+                                txid
+                            );
+                            continue;
+                        }
+                    }
+                }
             };
 
             let original_server = query.original_server;
@@ -483,6 +595,11 @@ fn purge_expired(pending: &mut HashMap<u16, VecDeque<PendingEntry>>) {
     });
 }
 
+fn purge_fallback_servers(servers: &mut VecDeque<FallbackServerEntry>) {
+    let now = Instant::now();
+    servers.retain(|entry| now.duration_since(entry.inserted_at) <= PENDING_TTL);
+}
+
 fn purge_inflight(inflight: &mut HashMap<u16, InflightEntry>) {
     let now = Instant::now();
     inflight.retain(|_, entry| {
@@ -508,6 +625,7 @@ enum SystemResolveOutcome {
 }
 const DNS_CLASS_IN: u16 = 1;
 const RCODE_SERVFAIL: u16 = 2;
+const RCODE_REFUSED: u16 = 5;
 const DEFAULT_TTL: u32 = 60;
 
 /// Finds the byte offset immediately after the question section.

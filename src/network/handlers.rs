@@ -71,6 +71,9 @@ pub struct DnsRedirect {
     pub proxy_addr_v6: Option<SocketAddr>,
     /// Callback to register a pending DNS query with the proxy.
     pub register_query: Arc<dyn Fn(PendingDnsQuery) + Send + Sync>,
+    /// Callback to register the original DNS server address at connect() time.
+    /// Used to support the connect()+write() pattern (e.g. Go's pure DNS resolver).
+    pub register_server: Arc<dyn Fn(SocketAddr) + Send + Sync>,
 }
 
 /// Tracks connected sockets for send() handling.
@@ -268,6 +271,13 @@ impl<'a> NetworkHandler<'a> {
                 self.handler.allow(notification)?;
                 return Ok(Decision::Allowed { target });
             }
+        }
+
+        // Register the original DNS server for the connect()+write() fallback path.
+        if parsed.port() == 53
+            && let Some(ref dns_redirect) = self.dns_redirect
+        {
+            (dns_redirect.register_server)(parsed.addr);
         }
 
         // Redirect DNS connections to the local proxy if configured
